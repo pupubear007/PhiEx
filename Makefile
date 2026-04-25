@@ -7,14 +7,20 @@
 #   make test      End-to-end APX sandbox sanity check
 #   make clean     Remove caches (not the conda env, not the weights)
 #
-# Requires miniforge (mamba). If `mamba` isn't on PATH, install from
-# https://github.com/conda-forge/miniforge  before running `make env`.
+# Works with either `mamba` (faster) or stock `conda`.  Auto-detects which
+# is available; you can override with `make env CONDA_TOOL=conda`.
+# Install miniforge from https://github.com/conda-forge/miniforge if you
+# have neither.
 
 ENV_NAME     := PhiEx
 MODELS_DIR   := ./models
 DATA_DIR     := ./data
-PYTHON       := mamba run -n $(ENV_NAME) python
-UVICORN      := mamba run -n $(ENV_NAME) uvicorn
+
+# Pick mamba if present, else conda.  Override on the command line:
+#   make env CONDA_TOOL=conda
+CONDA_TOOL   ?= $(shell command -v mamba >/dev/null 2>&1 && echo mamba || echo conda)
+PYTHON       := $(CONDA_TOOL) run -n $(ENV_NAME) python
+UVICORN      := $(CONDA_TOOL) run -n $(ENV_NAME) uvicorn
 
 .PHONY: env weights run test clean help
 
@@ -27,9 +33,9 @@ help:
 	@echo "  clean    remove caches (keeps env and weights)"
 
 env:
-	@echo "==> creating conda env '$(ENV_NAME)' (this takes ~20 min)"
-	mamba env create -f environment.yml
-	@echo "==> done. activate with:  mamba activate $(ENV_NAME)"
+	@echo "==> creating conda env '$(ENV_NAME)' with $(CONDA_TOOL) (this takes ~20 min)"
+	$(CONDA_TOOL) env create -f environment.yml
+	@echo "==> done. activate with:  $(CONDA_TOOL) activate $(ENV_NAME)"
 
 weights: $(MODELS_DIR)
 	@echo "==> downloading ML weights into $(MODELS_DIR)"

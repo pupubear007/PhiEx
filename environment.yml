@@ -6,10 +6,10 @@
 #
 # One environment, two platforms. The code picks the device at runtime.
 #
-# Install with mamba (via miniforge), NOT plain conda — plain conda's solver
-# cannot handle this stack in reasonable time:
+# Install with mamba (via miniforge) for speed, or stock conda:
 #
-#     mamba env create -f environment.yml
+#     mamba env create -f environment.yml      # ~5 min
+#     conda env create -f environment.yml      # ~20 min, same result
 #     mamba activate PhiEx
 #
 # Notes:
@@ -20,6 +20,20 @@
 #     node, create a separate `environment-cuda.yml`.
 #   • Heavy ML weights (ESMFold, ESM-2, MACE-OFF23) are NOT in this file.
 #     They're downloaded on first run into ./models/ — see `make weights`.
+#
+# OPTIONAL system tools (not on osx-arm64 conda channels — install manually
+# only if you want the *real* pipeline rather than the stub):
+#
+#   p2rank (Java pocket finder) — adapter falls back to a geometric stub if
+#                                  not on PATH.  To install the real thing:
+#       Linux:   conda install -n PhiEx -c bioconda p2rank
+#       macOS:   curl -L -o /tmp/p2rank.tar.gz \
+#                  https://github.com/rdk/p2rank/releases/download/2.4.2/p2rank_2.4.2.tar.gz
+#                tar xzf /tmp/p2rank.tar.gz -C ~/tools
+#                ln -s ~/tools/p2rank_2.4.2/prank /usr/local/bin/prank
+#
+#   foldseek — adapter falls back to canned APX neighbours if not on PATH.
+#       conda install -n PhiEx -c bioconda foldseek    # linux + osx-arm64
 
 name: PhiEx
 channels:
@@ -31,7 +45,10 @@ dependencies:
   # ─── Core ───────────────────────────────────────────────
   - python=3.11
   - pip
-  - mamba
+  # PyTorch's conda build for osx-arm64 is compiled against NumPy 1.x;
+  # NumPy 2 silently breaks the C API.  Pin to <2 until pytorch ships
+  # a NumPy-2 build.
+  - numpy<2
 
   # ─── Web backend ────────────────────────────────────────
   - fastapi
@@ -41,12 +58,13 @@ dependencies:
   - sse-starlette
 
   # ─── Scientific core ────────────────────────────────────
-  - numpy
+  # (numpy is pinned <2 above for PyTorch ABI compatibility)
   - scipy
   - pandas
   - scikit-learn
   - numba
   - matplotlib
+  - omegaconf       # required by fair-esm's ESMFold loader
 
   # ─── Structural bio ─────────────────────────────────────
   - mdanalysis
@@ -61,19 +79,22 @@ dependencies:
   - pytorch::torchvision
   - pytorch::torchaudio
 
-  # ─── Bio/chem ML ────────────────────────────────────────
-  - fair-esm          # ESM-2 and ESMFold
-
   # ─── Pocket detection / docking ─────────────────────────
-  - p2rank
+  # p2rank is omitted here — no osx-arm64 build on bioconda.  Adapter
+  # falls back to a geometric stub.  See header for manual-install steps.
   - vina
-  - openjdk=17        # required by P2Rank
+  - openjdk=17        # required if you later install p2rank manually
 
   # ─── Dynamics / statistics ──────────────────────────────
   - deeptime
 
+  # ─── Bridges OpenMM <-> PyTorch (conda-only, not on PyPI) ───
+  - openmm-ml
+
   # ─── pip-only dependencies (install last) ───────────────
+  # Several ML packages are pip-only or have inconsistent conda coverage
+  # across osx-arm64 / linux-64; pinning them here keeps one yml.
   - pip:
+      - fair-esm            # ESM-2 and ESMFold (pip canonical)
       - mace-torch          # MACE-OFF ML potential
-      - openmm-ml           # bridges OpenMM <-> PyTorch
       - scikit-optimize     # Bayesian acquisition for active learning
