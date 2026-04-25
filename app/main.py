@@ -39,7 +39,7 @@ from PhiEx.core.theory import THEORIES
 from PhiEx.pipeline.apx import APXPipeline, APX_DEFAULT_PDB
 
 # adapters used by the per-stage routes
-from PhiEx.adapters.pdb import fetch_protein, parse_pdb_text
+from PhiEx.adapters.pdb import fetch_protein, parse_pdb_text, list_pdbs_for_uniprot
 from PhiEx.adapters.esmfold import ESMFoldAdapter, ca_rmsd
 from PhiEx.adapters.esm2 import ESM2Adapter, attention_residue_importance
 from PhiEx.adapters.foldseek import FoldseekAdapter, aggregate_go_terms
@@ -124,6 +124,29 @@ async def api_theories():
 @app.get("/api/ticker/history")
 async def api_ticker_history():
     return {"events": TICKER.history()}
+
+
+@app.get("/api/uniprot/{uniprot_id}/pdbs")
+async def api_uniprot_pdbs(uniprot_id: str):
+    """Return all PDB entries cross-referenced from a UniProt ID, best
+    resolution first.  The frontend's "find PDB" button uses this."""
+    entries = list_pdbs_for_uniprot(uniprot_id)
+    return {"uniprot": uniprot_id, "n": len(entries), "entries": entries}
+
+
+@app.post("/api/reset")
+async def api_reset():
+    """Wipe the per-session protein/cofactor/pocket/dock/MD/AL state, the
+    learned-models registry, and the ticker replay buffer.  The frontend
+    calls this from the ⊗ RESET ALL button to start fresh."""
+    # preserve only the device + openmm platform we resolved at startup
+    keep = {k: SESSION[k] for k in ("device", "openmm_platform") if k in SESSION}
+    SESSION.clear()
+    SESSION.update(keep)
+    THEORIES.clear()
+    TICKER.clear_history()
+    log("sys", "session reset — fresh start")
+    return {"ok": True}
 
 
 # ────────────────────────────────────────────────────────────────────────

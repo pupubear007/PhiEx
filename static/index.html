@@ -171,6 +171,8 @@
     <h2><span class="sym">ϕ</span>SYSTEM (theory)</h2>
     <div class="row"><label>PDB</label><input id="i-pdb" type="text" value="1APX"></div>
     <div class="row"><label>UniProt</label><input id="i-uniprot" type="text" value="P48534"></div>
+    <button class="btn" id="find-pdb" style="font-size:11px;padding:6px 10px;margin:2px 0;">↳ FIND PDB FROM UNIPROT</button>
+    <div id="pdb-candidates" style="font-size:10px;color:var(--ink-dim);margin:4px 0;"></div>
     <div class="row"><label>MD ps</label><input id="i-ps" type="number" min="1" max="50" value="10" step="1"></div>
     <div class="row"><label>AL i steps</label><input id="i-iter" type="number" min="1" max="10" value="3" step="1"></div>
 
@@ -184,6 +186,7 @@
     <h2><span class="sym">s∃ ⟳ tϕ</span>INDUCTIVE</h2>
     <button class="btn s" id="run-al">⟳ NEXT ITERATION  (i ← i+1)</button>
     <button class="btn warn" id="run-all">⊙ RUN END-TO-END (streamed)</button>
+    <button class="btn" id="clear-3d">⊗ RESET ALL  (fresh start)</button>
 
     <h2><span class="sym">ϕ0</span>FUNCTION HYPOTHESIS</h2>
     <div class="readout" id="phi0-readout">no annotations yet — run stage 2</div>

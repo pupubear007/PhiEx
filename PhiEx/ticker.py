@@ -96,6 +96,11 @@ class Ticker:
     def history(self) -> list[dict]:
         return [asdict(ev) for ev in self._history]
 
+    def clear_history(self) -> None:
+        """Wipe the replay buffer so a fresh page load shows nothing.
+        Live subscribers are unaffected."""
+        self._history.clear()
+
 
 # Module-level singleton — there is exactly one ticker per process.
 TICKER = Ticker()

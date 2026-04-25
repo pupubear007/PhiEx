@@ -69,13 +69,26 @@ connectTicker();
 
 // ─────────────────────────────────────────────────────────────────────────
 // Mol* viewers — top: predicted, bottom: experimental
+//
+// We use loadStructureFromData (string in, no Blob URL round-trip) because
+// loadStructureFromUrl with an object-URL silently fails on some Mol*
+// builds.  Every step logs to console and surfaces a sys-line in the
+// on-screen ticker so you can tell from the UI whether structures arrived.
 // ─────────────────────────────────────────────────────────────────────────
 let predViewer = null, expViewer = null;
+let viewersReady = null;          // resolves when both viewers are alive
+
+function logSys(msg){
+  logLine({tag: "sys", t: Date.now()/1000, msg});
+}
+
 async function initViewers(){
   if (typeof molstar === "undefined") {
-    console.warn("Mol* not available; structure panes will be empty");
+    console.error("[viewer] Mol* global not present; CDN failed to load?");
+    logSys("Mol* failed to load — 3D panes will be empty");
     return;
   }
+  console.log("[viewer] Mol* version:", molstar.PLUGIN_VERSION || "(unknown)");
   const dark = {
     layoutIsExpanded: false,
     layoutShowControls: false,
@@ -90,33 +103,121 @@ async function initViewers(){
   try {
     predViewer = await molstar.Viewer.create("viewer-pred", dark);
     expViewer  = await molstar.Viewer.create("viewer-exp",  dark);
+    console.log("[viewer] both Mol* viewers initialised");
   } catch (e) {
-    console.error("Mol* init failed", e);
+    console.error("[viewer] Mol* init failed", e);
+    logSys("Mol* init failed: " + (e.message || e));
   }
 }
-initViewers();
+viewersReady = initViewers();
 
-async function loadPdbInto(viewer, pdbText, opts={}){
-  if (!viewer || !pdbText) return;
-  await viewer.clear();
-  const blob = new Blob([pdbText], { type: "text/plain" });
-  const url = URL.createObjectURL(blob);
-  await viewer.loadStructureFromUrl(url, "pdb", false, {
-    representationParams: { theme: { globalName: opts.coloring || "chain-id" } }
+// Per-viewer load lock — without this, two consecutive runs race:
+// run #1's clear() can be reordered relative to run #2's load() and
+// the previous structure stays in the viewport, causing overlap.
+const _loadLocks = new Map();   // keyed by container id (predViewer/expViewer get replaced)
+function _withLock(key, fn){
+  const prev = _loadLocks.get(key) || Promise.resolve();
+  const next = prev.then(fn, fn);     // run regardless of prior outcome
+  _loadLocks.set(key, next.catch(()=>{}));
+  return next;
+}
+
+// Mol*'s viewer.clear() is unreliable across builds — sometimes it
+// leaves structures resident.  The robust way to start fresh is to
+// destroy the viewer and recreate it.  We do this for both panes.
+async function _recreateViewer(containerId){
+  if (typeof molstar === "undefined") return null;
+  const dark = {
+    layoutIsExpanded: false,
+    layoutShowControls: false,
+    layoutShowSequence: false,
+    layoutShowLog: false,
+    layoutShowLeftPanel: false,
+    layoutShowRemoteState: false,
+    viewportShowExpand: false,
+    viewportShowSelectionMode: false,
+    viewportShowAnimation: false,
+  };
+  // Wipe the DOM children of the container so Mol* can mount cleanly.
+  const el = document.getElementById(containerId);
+  if (el) {
+    // Tell any existing viewer to clean up.
+    try {
+      const cur = containerId === "viewer-pred" ? predViewer : expViewer;
+      if (cur && cur.dispose) cur.dispose();
+      else if (cur && cur.plugin && cur.plugin.dispose) cur.plugin.dispose();
+    } catch (e) { console.warn("[viewer] dispose:", e); }
+    el.innerHTML = "";
+  }
+  try {
+    const v = await molstar.Viewer.create(containerId, dark);
+    console.log(`[viewer] ${containerId} recreated`);
+    return v;
+  } catch (e) {
+    console.error(`[viewer] recreate ${containerId} failed:`, e);
+    return null;
+  }
+}
+
+async function clearAllViewers(){
+  if (viewersReady) await viewersReady;
+  // Wait for any in-flight loads to finish before tearing down.
+  await Promise.all([
+    _loadLocks.get("viewer-pred") || Promise.resolve(),
+    _loadLocks.get("viewer-exp")  || Promise.resolve(),
+  ]);
+  console.log("[viewer] clearing both viewers (destroy + recreate)");
+  predViewer = await _recreateViewer("viewer-pred");
+  expViewer  = await _recreateViewer("viewer-exp");
+  // Reset the load locks so future loads don't queue behind stale promises.
+  _loadLocks.delete("viewer-pred");
+  _loadLocks.delete("viewer-exp");
+  logSys("3D viewers cleared");
+}
+
+// loadStructureFromData accepts a raw PDB string directly. We hold a
+// per-container lock so successive runs don't interleave clear/load and
+// stack structures on top of each other.  The viewer reference can be
+// replaced (by clearAllViewers) so we resolve it from the container id
+// at execution time, not capture time.
+async function loadPdbInto(containerId, pdbText, opts={}){
+  if (!pdbText) {
+    console.warn("[viewer] empty pdb_text — nothing to render");
+    return;
+  }
+  return _withLock(containerId, async () => {
+    const viewer = (containerId === "viewer-pred") ? predViewer : expViewer;
+    if (!viewer) {
+      console.warn(`[viewer] ${containerId} not initialised`);
+      return;
+    }
+    console.log(`[viewer] loading ${pdbText.length} bytes of PDB into ${opts.label||containerId}`);
+    try {
+      // Primary path: loadStructureFromData (string → trajectory, no fetch)
+      await viewer.loadStructureFromData(pdbText, "pdb", false);
+      console.log(`[viewer] ${opts.label||containerId} loaded OK`);
+    } catch (e) {
+      console.error(`[viewer] loadStructureFromData failed for ${opts.label||containerId}:`, e);
+      // Fallback: blob-URL path (older Mol* builds)
+      try {
+        const blob = new Blob([pdbText], { type: "text/plain" });
+        const url  = URL.createObjectURL(blob);
+        await viewer.loadStructureFromUrl(url, "pdb", false);
+        console.log(`[viewer] ${opts.label||containerId} loaded via fallback URL`);
+      } catch (e2) {
+        console.error(`[viewer] fallback also failed for ${opts.label||containerId}:`, e2);
+        logSys(`3D load failed (${opts.label||containerId}): ${e2.message || e2}`);
+      }
+    }
   });
 }
 
-// pLDDT colouring: write pLDDT into B-factor column then ask Mol* to colour
-// by B-factor.  This is the standard trick.  The backend already wrote
-// pLDDT into the b-factor column in the predicted PDB text.
+// pLDDT colouring: the backend writes pLDDT into the B-factor column
+// of the predicted PDB.  We just load the structure; Mol*'s default
+// preset already colours by B-factor when values are present, and the
+// user can flip presets in the viewport menu if they want.
 async function loadPredictedWithPlddt(pdbText){
-  if (!predViewer) return;
-  await predViewer.clear();
-  const blob = new Blob([pdbText], { type: "text/plain" });
-  const url = URL.createObjectURL(blob);
-  await predViewer.loadStructureFromUrl(url, "pdb", false, {
-    representationParams: { theme: { globalName: "atom-property" } }
-  });
+  return loadPdbInto("viewer-pred", pdbText, {label: "predicted"});
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -176,7 +277,7 @@ $("#run-structure").addEventListener("click", async () => {
                                 + " ± " + (r.predicted.plddt_sd||0).toFixed(1);
     }
     if (r.experimental && r.experimental.pdb_text)
-      await loadPdbInto(expViewer, r.experimental.pdb_text);
+      await loadPdbInto("viewer-exp", r.experimental.pdb_text, {label: "experimental"});
     if (r.rmsd_pred_vs_exp != null)
       $("#v-rmsd").textContent = r.rmsd_pred_vs_exp.toFixed(2);
     $("#state-readout").innerHTML =
@@ -251,6 +352,103 @@ $("#run-al").addEventListener("click", async () => {
       `RMSE <b>${last.rmse!=null?last.rmse.toFixed(3):"—"}</b> · R² <b>${last.r2!=null?last.r2.toFixed(3):"—"}</b>`;
   } catch(e){ alert("active-learning: "+e.message); }
 });
+
+// Find PDB(s) for a UniProt ID. Auto-fills the PDB field with the best
+// match (highest-resolution X-ray) and lists alternates underneath.
+$("#find-pdb").addEventListener("click", async () => {
+  const uni = $("#i-uniprot").value.trim();
+  const out = $("#pdb-candidates");
+  if (!uni) { out.innerHTML = "enter a UniProt ID first"; return; }
+  out.innerHTML = "looking up…";
+  try {
+    const r = await fetch(`/api/uniprot/${encodeURIComponent(uni)}/pdbs`).then(r => r.json());
+    if (!r.entries || !r.entries.length) {
+      out.innerHTML = `<span style="color:var(--s)">no PDB entries for ${uni} — try ESMFold-only (leave PDB blank or use any 4-letter placeholder; the predicted structure will still render)</span>`;
+      return;
+    }
+    // Auto-fill the PDB field with the best (first) entry
+    $("#i-pdb").value = r.entries[0].pdb_id;
+    // Render the top 10 candidates so the user can pick a different one.
+    // Model entries (SWISS-MODEL, AlphaFold) are tagged in a distinct colour
+    // so it's obvious they're predicted, not experimental.
+    const rows = r.entries.slice(0, 10).map(e => {
+      const res = e.resolution != null ? e.resolution.toFixed(2) + " Å" : "—";
+      const isBest = e === r.entries[0] ? '<b style="color:var(--accent)">★ </b>' : "";
+      const isModel = /SWISS|AlphaFold|Modeling|Predicted/i.test(e.method || "")
+                      || /^(SWISS|AF):/.test(e.pdb_id || "");
+      const idColor = isModel ? "var(--stub)" : "var(--ink)";
+      return `<div style="cursor:pointer;padding:2px 0" data-pdb="${e.pdb_id}">
+        ${isBest}<b style="color:${idColor}">${e.pdb_id}</b>
+        <span> · ${e.method||"—"} · ${res} · ${e.chains||""}</span>
+      </div>`;
+    }).join("");
+    out.innerHTML = `<div style="margin-bottom:4px;color:var(--phi)">${r.n} PDB entries — click to pick</div>${rows}`;
+    // Click-to-pick on the alternates
+    out.querySelectorAll("[data-pdb]").forEach(el => {
+      el.addEventListener("click", () => {
+        $("#i-pdb").value = el.getAttribute("data-pdb");
+        out.querySelectorAll("[data-pdb]").forEach(x =>
+          x.style.background = x === el ? "var(--rule)" : "");
+      });
+    });
+  } catch (e) {
+    out.innerHTML = `<span style="color:var(--s)">lookup failed: ${e.message||e}</span>`;
+  }
+});
+
+// Manual reset button — wipes EVERYTHING:
+//   * both 3D viewers (destroy + recreate)
+//   * all right-hand readouts (pockets, poses, MD, AL, cross-check)
+//   * the bottom ticker
+//   * frontend in-memory caches (lastStruct, lastPockets, lastPoses, lastDyn, lastAL)
+//   * inline charts (poses bars, energy curve, AL heatmap)
+//   * backend session state (POST /api/reset clears protein, cofactors,
+//     pockets, traj, surrogate, AL loop, learned-models registry, ticker history)
+async function resetAll(){
+  // 1. backend
+  try {
+    await fetch("/api/reset", {method: "POST"});
+    console.log("[reset] backend session cleared");
+  } catch (e) {
+    console.warn("[reset] /api/reset failed:", e);
+  }
+
+  // 2. 3D viewers
+  await clearAllViewers();
+
+  // 3. frontend caches
+  lastStruct = null; lastPockets = null; lastPoses = null; lastDyn = null;
+  lastAL = [];
+
+  // 4. side-panel readouts — restore initial empty messages
+  $("#phi0-readout").innerHTML       = "no annotations yet — run stage 2";
+  $("#state-readout").innerHTML      = "protein: <b>—</b><br>cofactors: <b>—</b><br>active site: <b>—</b>";
+  $("#theories-readout").innerHTML   = "none loaded";
+  $("#pockets-readout").innerHTML    = "no pockets yet";
+  $("#poses-readout").innerHTML      = "no poses yet";
+  $("#md-readout").innerHTML         = "MACE region: <b id=\"v-mace-n\">—</b> atoms<br>" +
+                                        "MACE E: <b id=\"v-mace\">—</b> ± <b id=\"v-mace-sd\">—</b> eV<br>" +
+                                        "residence near heme Fe: <b id=\"v-res\">—</b> ps";
+  $("#al-readout").innerHTML         = "no iterations yet";
+  $("#cross-readout").innerHTML      = "run AL first to populate";
+  $("#struct-readout").innerHTML     = "mean pLDDT: <b id=\"v-plddt\">—</b><br>" +
+                                        "Cα RMSD vs experimental: <b id=\"v-rmsd\">—</b> Å<br>" +
+                                        "ESM-2 embed σ: <b id=\"v-emb\">—</b>";
+
+  // 5. clear the inline canvases
+  ["#poses-chart", "#energy-chart", "#al-heatmap"].forEach(sel => {
+    const c = $(sel);
+    if (!c) return;
+    const ctx = c.getContext("2d");
+    ctx.clearRect(0, 0, c.width, c.height);
+  });
+
+  // 6. clear the ticker (keep only the header line)
+  TICKER.querySelectorAll(".log-line").forEach(el => el.remove());
+
+  console.log("[reset] full reset complete");
+}
+$("#clear-3d").addEventListener("click", resetAll);
 
 $("#run-all").addEventListener("click", async () => {
   // Streamed end-to-end run — server emits SSE events, the ticker shows
@@ -384,8 +582,20 @@ function drawALHeatmap(history){
 // streamed end-to-end result handler
 // ─────────────────────────────────────────────────────────────────────────
 function renderResult(r){
-  if (r.predicted_pdb_text) loadPredictedWithPlddt(r.predicted_pdb_text);
-  if (r.experimental_pdb_text) loadPdbInto(expViewer, r.experimental_pdb_text);
+  console.log("[result] keys:", Object.keys(r));
+  console.log("[result] predicted_pdb_text:",
+              r.predicted_pdb_text ? r.predicted_pdb_text.length + " bytes" : "null");
+  console.log("[result] experimental_pdb_text:",
+              r.experimental_pdb_text ? r.experimental_pdb_text.length + " bytes" : "null");
+  logSys(`structures received — predicted: ${r.predicted_pdb_text?r.predicted_pdb_text.length+" B":"null"}, experimental: ${r.experimental_pdb_text?r.experimental_pdb_text.length+" B":"null"}`);
+
+  // Wait for both viewers to finish initialising before loading.
+  const loadStructures = async () => {
+    if (viewersReady) await viewersReady;
+    if (r.predicted_pdb_text)    await loadPredictedWithPlddt(r.predicted_pdb_text);
+    if (r.experimental_pdb_text) await loadPdbInto("viewer-exp", r.experimental_pdb_text, {label:"experimental"});
+  };
+  loadStructures();
   if (r.mean_plddt != null)
     $("#v-plddt").textContent = r.mean_plddt.toFixed(1) + " ± " + (r.plddt_sd||0).toFixed(1);
   if (r.rmsd_pred_vs_exp != null) $("#v-rmsd").textContent = r.rmsd_pred_vs_exp.toFixed(2);

@@ -67,6 +67,10 @@ class TheoryRegistry:
     def info(self) -> list[dict]:
         return [m.info() for m in self._models.values()]
 
+    def clear(self) -> None:
+        """Drop every registered model — used by /api/reset for fresh starts."""
+        self._models.clear()
+
 
 # session-level singleton (one per process, like the ticker)
 THEORIES = TheoryRegistry()

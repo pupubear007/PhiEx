@@ -45,12 +45,140 @@ def _fetch_text(url: str, timeout: float = 15.0) -> Optional[str]:
         return None
 
 
+def list_pdbs_for_uniprot(uniprot_id: str, timeout: float = 10.0) -> list[dict]:
+    """Look up every PDB entry cross-referenced from a UniProt accession.
+
+    Returns a list of dicts like:
+        [{"pdb_id": "2CYP", "method": "X-ray", "resolution": 1.7,
+          "chains": "A=1-294", "raw": <full xref dict>}, ...]
+
+    Sorted by resolution (best first), with non-X-ray entries last.  Empty
+    list means no experimental structure is mapped to this UniProt ID —
+    you can still run ESMFold-only and get a predicted structure.
+    """
+    try:
+        import httpx, json as _json
+    except ImportError:
+        return []
+    url = f"https://rest.uniprot.org/uniprotkb/{uniprot_id}.json"
+    try:
+        with httpx.Client(timeout=timeout) as c:
+            r = c.get(url, headers={"User-Agent": "PhiEx/0.1",
+                                     "Accept": "application/json"})
+            if r.status_code != 200:
+                log("sys", f"UniProt lookup HTTP {r.status_code} for {uniprot_id}")
+                return []
+            data = r.json()
+    except Exception as e:
+        log("sys", f"UniProt lookup failed: {e}")
+        return []
+    out: list[dict] = []
+    for x in data.get("uniProtKBCrossReferences", []):
+        if x.get("database") != "PDB":
+            continue
+        props = {p["key"]: p["value"] for p in x.get("properties", [])}
+        # resolution comes as e.g. "1.70 A" — extract the float
+        res_str = props.get("Resolution", "") or ""
+        res_val = None
+        try:
+            res_val = float(res_str.split()[0])
+        except Exception:
+            pass
+        out.append({
+            "pdb_id":     x.get("id", ""),
+            "method":     props.get("Method", ""),
+            "resolution": res_val,
+            "chains":     props.get("Chains", ""),
+        })
+    # sort: x-ray first by resolution asc, then NMR / EM, then unknown
+    def _key(r):
+        method_rank = 0 if "X-ray" in (r["method"] or "") else 1
+        res = r["resolution"] if r["resolution"] is not None else 1e6
+        return (method_rank, res)
+    out.sort(key=_key)
+
+    # Append model-based fallbacks so the UI can offer them when no
+    # experimental structure exists (very common for fungal proteins).
+    # We probe quietly with HEAD/GET and only list what's actually there.
+    sm = _swissmodel_summary(uniprot_id)
+    if sm:
+        out.append(sm)
+    af = _alphafold_summary(uniprot_id)
+    if af:
+        out.append(af)
+
+    log("phi", f"UniProt {uniprot_id}: found {len(out)} structural entries (incl. models)")
+    return out
+
+
+def _swissmodel_summary(uniprot_id: str, timeout: float = 6.0) -> Optional[dict]:
+    """Probe SWISS-MODEL repository and return a list-entry dict if a model exists."""
+    try:
+        import httpx
+    except ImportError:
+        return None
+    url = f"https://swissmodel.expasy.org/repository/uniprot/{uniprot_id}.pdb"
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=True) as c:
+            r = c.head(url, headers={"User-Agent": "PhiEx/0.1"})
+            if r.status_code == 200:
+                return {
+                    "pdb_id":     f"SWISS:{uniprot_id}",
+                    "method":     "SWISS-MODEL (homology)",
+                    "resolution": None,
+                    "chains":     "",
+                }
+    except Exception:
+        pass
+    return None
+
+
+def _alphafold_summary(uniprot_id: str, timeout: float = 6.0) -> Optional[dict]:
+    """Probe AlphaFold DB and return a list-entry dict if a prediction exists."""
+    try:
+        import httpx
+    except ImportError:
+        return None
+    url = f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_v4.pdb"
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=True) as c:
+            r = c.head(url, headers={"User-Agent": "PhiEx/0.1"})
+            if r.status_code == 200:
+                return {
+                    "pdb_id":     f"AF:{uniprot_id}",
+                    "method":     "AlphaFold (predicted)",
+                    "resolution": None,
+                    "chains":     "",
+                }
+    except Exception:
+        pass
+    return None
+
+
 def fetch_pdb_text(pdb_id: str, cache_dir: str | os.PathLike = "data/pdb") -> Optional[str]:
     """Return raw PDB text for `pdb_id` or None if unfetchable.  Caches to disk
-    so re-runs are fast and the test target works offline after first run."""
-    pdb_id = pdb_id.upper()
+    so re-runs are fast and the test target works offline after first run.
+
+    Special prefixes route to alternative structure sources:
+        SWISS:<UniProt>  → SWISS-MODEL homology model for that accession
+        AF:<UniProt>     → AlphaFold DB prediction for that accession
+        AF2:<UniProt>    → alias for AF:
+    Anything else is treated as an RCSB PDB code.
+    """
+    pdb_id = pdb_id.upper().strip()
     cache = Path(cache_dir)
     cache.mkdir(parents=True, exist_ok=True)
+    # Special prefixes
+    if ":" in pdb_id:
+        prefix, acc = pdb_id.split(":", 1)
+        prefix = prefix.upper().strip()
+        acc = acc.strip()
+        if prefix == "SWISS":
+            return fetch_swissmodel_pdb(acc, cache_dir=cache_dir)
+        if prefix in ("AF", "AF2", "ALPHAFOLD"):
+            return fetch_alphafold_pdb(acc, cache_dir=cache_dir)
+        log("sys", f"unknown structure prefix '{prefix}' — falling back to RCSB lookup of {acc}")
+        pdb_id = acc
     cached = cache / f"{pdb_id}.pdb"
     if cached.exists():
         log("phi", f"PDB {pdb_id}: loaded from cache")
@@ -61,6 +189,63 @@ def fetch_pdb_text(pdb_id: str, cache_dir: str | os.PathLike = "data/pdb") -> Op
         cached.write_text(text)
         log("phi", f"PDB {pdb_id}: fetched ({len(text)} bytes) and cached")
         return text
+    return None
+
+
+def fetch_swissmodel_pdb(uniprot_id: str,
+                         cache_dir: str | os.PathLike = "data/pdb") -> Optional[str]:
+    """Fetch the best SWISS-MODEL homology model for a UniProt accession.
+
+    SWISS-MODEL exposes its repository at
+        https://swissmodel.expasy.org/repository/uniprot/{ID}.pdb
+    which redirects to the highest-quality automated model (sorted by
+    GMQE / coverage on the SWISS-MODEL side).  We just take whatever it
+    returns and cache it as SWISS_<id>.pdb so it doesn't collide with
+    RCSB cache entries of the same accession.
+    """
+    uniprot_id = uniprot_id.upper().strip()
+    cache = Path(cache_dir)
+    cache.mkdir(parents=True, exist_ok=True)
+    cached = cache / f"SWISS_{uniprot_id}.pdb"
+    if cached.exists():
+        log("phi", f"SWISS-MODEL {uniprot_id}: loaded from cache")
+        return cached.read_text()
+    url = f"https://swissmodel.expasy.org/repository/uniprot/{uniprot_id}.pdb"
+    text = _fetch_text(url)
+    if text and text.lstrip().startswith(("HEADER", "ATOM", "REMARK", "TITLE")):
+        cached.write_text(text)
+        log("phi", f"SWISS-MODEL {uniprot_id}: fetched ({len(text)} bytes) and cached")
+        return text
+    log("sys", f"SWISS-MODEL {uniprot_id}: no model available")
+    return None
+
+
+def fetch_alphafold_pdb(uniprot_id: str,
+                        cache_dir: str | os.PathLike = "data/pdb") -> Optional[str]:
+    """Fetch the AlphaFold DB prediction for a UniProt accession.
+
+    AlphaFold DB serves PDBs at predictable URLs:
+        https://alphafold.ebi.ac.uk/files/AF-{ID}-F1-model_v4.pdb
+    For most fungal proteins (and indeed most of UniProt) AlphaFold has a
+    prediction, so this is the most reliable fallback when no PDB and no
+    SWISS-MODEL exist.
+    """
+    uniprot_id = uniprot_id.upper().strip()
+    cache = Path(cache_dir)
+    cache.mkdir(parents=True, exist_ok=True)
+    cached = cache / f"AF_{uniprot_id}.pdb"
+    if cached.exists():
+        log("phi", f"AlphaFold {uniprot_id}: loaded from cache")
+        return cached.read_text()
+    # Try v4 first (current as of late 2023+); fall back to v3, v2.
+    for v in ("v4", "v3", "v2"):
+        url = f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_{v}.pdb"
+        text = _fetch_text(url)
+        if text and text.lstrip().startswith(("HEADER", "ATOM", "REMARK", "TITLE")):
+            cached.write_text(text)
+            log("phi", f"AlphaFold {uniprot_id} ({v}): fetched ({len(text)} bytes) and cached")
+            return text
+    log("sys", f"AlphaFold {uniprot_id}: no prediction available")
     return None
 
 
