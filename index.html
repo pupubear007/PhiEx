@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>ϕ → ∃ — Reaction Workbench / Prototype 0</title>
+<style>
+  /* ————————————————— Reset / Base ————————————————— */
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg:        #0b0d10;
+    --panel:     #12151a;
+    --ink:       #e8e6df;
+    --ink-dim:   #8a8a80;
+    --rule:      #2a2d33;
+    --phi:       #6aa9ff;   /* deductive blue — ϕ → ∃ */
+    --phi-soft:  #3d5a8a;
+    --s:         #e05a4a;   /* inductive red — s∃ ⟳ tϕ */
+    --s-soft:    #7a3028;
+    --accent:    #d4c27a;   /* warm accent, barrier/theory */
+    --good:      #8fbf7f;
+  }
+  html, body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "JetBrains Mono", "IBM Plex Mono", ui-monospace, monospace;
+    font-size: 13px;
+    height: 100%;
+    overflow: hidden;
+  }
+  /* ————————————————— Layout ————————————————— */
+  .app {
+    display: grid;
+    grid-template-columns: 300px 1fr 320px;
+    grid-template-rows: 44px 1fr 180px;
+    grid-template-areas:
+      "head head head"
+      "left stage right"
+      "left ticker right";
+    height: 100vh;
+    gap: 1px;
+    background: var(--rule);
+  }
+  header {
+    grid-area: head;
+    background: var(--bg);
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 0 20px;
+    border-bottom: 1px solid var(--rule);
+  }
+  header .title { letter-spacing: 2px; font-size: 12px; color: var(--ink-dim); }
+  header .title b { color: var(--ink); letter-spacing: 0; font-weight: 600; }
+  header .mode { display: flex; gap: 2px; }
+  header .mode button {
+    background: transparent; color: var(--ink-dim);
+    border: 1px solid var(--rule);
+    padding: 6px 14px; font: inherit; cursor: pointer;
+    letter-spacing: 1px;
+  }
+  header .mode button.on {
+    background: var(--ink); color: var(--bg);
+    border-color: var(--ink);
+  }
+  header .mode button:hover:not(.on) { color: var(--ink); border-color: var(--ink-dim); }
+
+  aside.left, aside.right {
+    background: var(--panel); overflow-y: auto; padding: 16px;
+  }
+  aside.left  { grid-area: left;  border-right: 1px solid var(--rule); }
+  aside.right { grid-area: right; border-left: 1px solid var(--rule); }
+  aside h2 {
+    font-size: 10px; letter-spacing: 2px; color: var(--ink-dim);
+    text-transform: uppercase; margin: 20px 0 8px; font-weight: 500;
+  }
+  aside h2:first-child { margin-top: 0; }
+  aside .row { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; }
+  aside .row label { color: var(--ink-dim); }
+  aside .row .val { color: var(--ink); font-variant-numeric: tabular-nums; }
+  aside input[type=range] { width: 150px; accent-color: var(--phi); }
+  aside.right input[type=range] { accent-color: var(--s); }
+  aside .btn {
+    display: block; width: 100%; text-align: left; background: transparent;
+    border: 1px solid var(--rule); color: var(--ink);
+    padding: 10px 12px; margin: 6px 0; font: inherit; cursor: pointer;
+    letter-spacing: 1px;
+  }
+  aside .btn:hover { border-color: var(--ink-dim); }
+  aside .btn.phi:hover  { border-color: var(--phi);  color: var(--phi); }
+  aside .btn.s:hover    { border-color: var(--s);    color: var(--s); }
+  aside .btn.reset:hover { border-color: var(--accent); color: var(--accent); }
+  aside .readout {
+    font-size: 11px; color: var(--ink-dim);
+    border-left: 2px solid var(--rule);
+    padding: 6px 10px; margin: 4px 0; line-height: 1.6;
+  }
+  aside .readout b { color: var(--ink); }
+  aside .formula {
+    font-size: 18px; letter-spacing: 2px; text-align: center;
+    padding: 12px 0; color: var(--ink);
+    border-top: 1px solid var(--rule);
+    border-bottom: 1px solid var(--rule);
+    margin: 6px 0 14px;
+  }
+  aside .formula .op { color: var(--accent); margin: 0 6px; }
+
+  main {
+    grid-area: stage; background: var(--bg); position: relative;
+    display: grid; grid-template-rows: 1fr 1fr; gap: 1px;
+    background: var(--rule);
+  }
+  .pane { position: relative; background: var(--bg); overflow: hidden; }
+  .pane .pane-label {
+    position: absolute; top: 12px; left: 16px; z-index: 10;
+    font-size: 10px; letter-spacing: 2px; color: var(--ink-dim);
+    text-transform: uppercase;
+  }
+  .pane .pane-label .sym { color: var(--ink); font-size: 13px; letter-spacing: 0; margin-right: 8px; }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  .ticker {
+    grid-area: ticker; background: var(--panel);
+    border-top: 1px solid var(--rule);
+    overflow-y: auto; padding: 12px 16px;
+    font-size: 11px; color: var(--ink-dim); line-height: 1.7;
+  }
+  .ticker .log-line { display: grid; grid-template-columns: 60px 30px 1fr; gap: 12px; }
+  .ticker .log-line .t  { color: var(--ink-dim); font-variant-numeric: tabular-nums; }
+  .ticker .log-line .k  { color: var(--accent); }
+  .ticker .log-line.phi .k { color: var(--phi); }
+  .ticker .log-line.s   .k { color: var(--s); }
+  .ticker .log-line .m  { color: var(--ink); }
+  .ticker h3 {
+    font-size: 10px; letter-spacing: 2px; color: var(--ink-dim);
+    text-transform: uppercase; margin-bottom: 8px; font-weight: 500;
+  }
+
+  /* tiny chart axes */
+  .axes { stroke: var(--rule); stroke-width: 1; }
+  .axis-label { fill: var(--ink-dim); font-size: 9px; letter-spacing: 1px; }
+</style>
+</head>
+<body>
+
+<div class="app">
+
+  <header>
+    <div class="title"><b>ϕ → ∃</b> &nbsp;·&nbsp; REACTION WORKBENCH &nbsp;·&nbsp; PROTOTYPE 0 &nbsp;·&nbsp; F + H₂ → HF + H</div>
+    <div class="mode">
+      <button id="mode-phi" class="on">ϕ → ∃ &nbsp;DEDUCTIVE</button>
+      <button id="mode-s">s∃ ⟳ tϕ &nbsp;INDUCTIVE</button>
+    </div>
+  </header>
+
+  <!-- ————— LEFT PANEL: DEDUCTIVE / THEORY ————— -->
+  <aside class="left">
+    <h2>System  (ϕ)</h2>
+    <div class="formula">F &nbsp;+&nbsp; H<span style="font-size:10px">₂</span> <span class="op">→</span> HF &nbsp;+&nbsp; H</div>
+
+    <h2>Theory  (tϕ)</h2>
+    <div class="row"><label>Barrier  E<sub>a</sub></label><span class="val" id="v-ea">1.60</span></div>
+    <input type="range" id="s-ea" min="0.2" max="3.0" step="0.01" value="1.60" style="width:100%">
+
+    <div class="row"><label>Exoergicity  ΔE</label><span class="val" id="v-de">-1.40</span></div>
+    <input type="range" id="s-de" min="-3.0" max="0.0" step="0.01" value="-1.40" style="width:100%">
+
+    <h2>Initial  (s∃)</h2>
+    <div class="row"><label>Kinetic  E<sub>k</sub></label><span class="val" id="v-ek">2.00</span></div>
+    <input type="range" id="s-ek" min="0.1" max="4.0" step="0.01" value="2.00" style="width:100%">
+
+    <div class="row"><label>Impact  b</label><span class="val" id="v-b">0.00</span></div>
+    <input type="range" id="s-b" min="-1.0" max="1.0" step="0.01" value="0.00" style="width:100%">
+
+    <h2>Run</h2>
+    <button class="btn phi" id="run-one">▸  SINGLE  ϕ → ∃</button>
+    <button class="btn s"   id="run-batch">⟳  BATCH   s∃ ⟳ tϕ  (200)</button>
+    <button class="btn reset" id="reset">✕  RESET</button>
+
+    <h2>State</h2>
+    <div class="readout" id="state-read">
+      step <b>0</b> &nbsp;·&nbsp; t = <b>0.00</b> fs<br>
+      r(F–H) = <b>—</b> &nbsp;·&nbsp; r(H–H) = <b>—</b><br>
+      status: <b>IDLE</b>
+    </div>
+  </aside>
+
+  <!-- ————— CENTER STAGE: two panes ————— -->
+  <main>
+    <div class="pane">
+      <div class="pane-label"><span class="sym">ϕ → ∃</span>ATOMIC  /  DEDUCTIVE  TRAJECTORY</div>
+      <canvas id="atoms"></canvas>
+    </div>
+    <div class="pane">
+      <div class="pane-label"><span class="sym">s∃ ⟳ tϕ</span>ENERGY  SURFACE  /  REACTION  COORDINATE</div>
+      <canvas id="energy"></canvas>
+    </div>
+  </main>
+
+  <!-- ————— RIGHT PANEL: INDUCTIVE / STATISTICS ————— -->
+  <aside class="right">
+    <h2>Inductive  (s∃ ⟳ tϕ)</h2>
+    <div class="readout" id="induct-read">
+      trials <b id="v-n">0</b> &nbsp;·&nbsp; reactions <b id="v-r">0</b><br>
+      P(reaction) = <b id="v-p">—</b><br>
+      iteration i = <b id="v-i">0</b>
+    </div>
+
+    <h2>Refined theory  (tϕ)</h2>
+    <div class="readout">
+      fitted E<sub>a</sub> = <b id="v-fit-ea">—</b><br>
+      Arrhenius k(E<sub>k</sub>) ∝ <b id="v-arr">—</b>
+    </div>
+
+    <h2>Histogram — Eₖ of reactive trials</h2>
+    <canvas id="hist" style="height: 140px;"></canvas>
+
+    <h2>P(reaction)  vs  Eₖ</h2>
+    <canvas id="arr" style="height: 140px;"></canvas>
+  </aside>
+
+  <!-- ————— BOTTOM TICKER ————— -->
+  <div class="ticker" id="ticker">
+    <h3>Reasoning trace  ·  i = iteration, ϕ = theory update, ∃ = outcome</h3>
+  </div>
+
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════════
+//  F + H₂ → HF + H  —  minimal 1-D reactive model
+//
+//  Framework mapping (Wang 2025):
+//     ϕ  — theory:     V(r_FH, r_HH)  (a LEPS-like 1-D potential along the
+//                      collinear F···H–H reaction coordinate).
+//     ∃  — outcome:    reactant | transition | product
+//     s∃ — sampled existence:  each stochastic trajectory (Ek, b) → outcome
+//     tϕ — refined theory:     fitted Ea from the batch (Arrhenius-style)
+//     i  — iteration:          the batch index
+//     ↑↓ — polarity:           forward (reactant→product) vs backward
+//
+//  We use a simplified 1-D effective potential along the reaction
+//  coordinate ξ ∈ [0,1] where ξ=0 is reactants (F + H–H) and ξ=1
+//  is products (H–F + H). The barrier is at ξ*≈0.5. This is a
+//  pedagogical model, NOT chemically accurate — the real F+H₂
+//  surface is a 2-D LEPS/PES. Accuracy is not the goal; the goal
+//  is a correct information-flow template under your framework.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const state = {
+  Ea: 1.60,       // barrier height (arb. units, ~ eV-ish)
+  dE: -1.40,      // exoergicity (products lower by |dE|)
+  Ek: 2.00,       // initial kinetic energy along reaction coordinate
+  b:  0.00,       // impact parameter / lateral offset
+  mode: 'phi',    // 'phi' (deductive single) or 's' (inductive batch)
+  running: false,
+  t: 0,           // time steps (fs-ish)
+  xi: 0,          // reaction coordinate
+  vxi: 0,         // velocity along it
+  trial: 0,
+  reactions: 0,
+  iter: 0,
+  histogram: [],  // Ek values of reactive trials
+  arrhenius: [],  // {Ek, P} points
+  ticker: [],
+};
+
+// ————— V(ξ) : Eckart-like asymmetric barrier ————————————————————————————
+function V(xi, Ea, dE) {
+  // smooth asymmetric barrier: reactants at 0, barrier Ea at xi*, products at dE
+  // using a blend of a gaussian-ish barrier + a sigmoidal offset
+  const barrier = Ea * Math.exp(-Math.pow((xi - 0.5) / 0.18, 2));
+  const slope   = dE * (1 / (1 + Math.exp(-10 * (xi - 0.5))));
+  return barrier + slope;
+}
+function dVdx(xi, Ea, dE) {
+  const eps = 1e-4;
+  return (V(xi + eps, Ea, dE) - V(xi - eps, Ea, dE)) / (2 * eps);
+}
+
+// ————— Single trajectory: Verlet integration along ξ ————————————————————
+// returns an array of samples [{t, xi, E, phase}]
+function runTrajectory({Ea, dE, Ek, b, noise=0.0}) {
+  // impact parameter reduces effective energy along RC
+  const Eeff = Math.max(0.01, Ek - 0.5 * b * b);
+  let xi = 0.02;
+  let v = Math.sqrt(2 * Eeff);  // m=1 units
+  const dt = 0.02;
+  const samples = [];
+  let phase = 'reactant';
+  for (let step = 0; step < 600; step++) {
+    const f = -dVdx(xi, Ea, dE) + (noise ? (Math.random()-0.5)*noise : 0);
+    v += f * dt;
+    xi += v * dt;
+    const E = 0.5*v*v + V(xi, Ea, dE);
+    // phase classification
+    if      (xi < 0.35) phase = 'reactant';
+    else if (xi > 0.65) phase = 'product';
+    else                phase = 'transition';
+    samples.push({t: step*dt, xi, v, E, phase});
+    if (xi > 1.05) { phase = 'product';  break; }
+    if (xi < -0.05){ phase = 'recoiled'; break; }
+    if (step > 400 && Math.abs(v) < 0.02) break; // trapped
+  }
+  const reacted = (samples[samples.length-1].xi > 0.65);
+  return { samples, reacted, Eeff };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  RENDERING
+// ═══════════════════════════════════════════════════════════════════════════
+function fitCanvas(c) {
+  const r = c.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  c.width = r.width * dpr; c.height = r.height * dpr;
+  const ctx = c.getContext('2d'); ctx.scale(dpr, dpr);
+  return { ctx, w: r.width, h: r.height };
+}
+
+// ————— TOP PANE: atoms in 2-D (F approaches H–H collinearly) ————————————
+function drawAtoms(xi, phase) {
+  const c = document.getElementById('atoms');
+  const { ctx, w, h } = fitCanvas(c);
+  ctx.clearRect(0,0,w,h);
+
+  // grid / frame
+  ctx.strokeStyle = '#1a1d22'; ctx.lineWidth = 1;
+  for (let x=40; x<w; x+=40) { ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke(); }
+  for (let y=40; y<h; y+=40) { ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }
+
+  const cx = w/2, cy = h/2;
+  // positions derived from xi
+  //   xi=0:  F----H-H          (F far left, H2 bonded on the right)
+  //   xi=1:  F-H      H         (F bonded to left H, right H ejected)
+  // we show a simple 1-D collinear arrangement along x
+  const span = Math.min(w * 0.8, 500);
+  const leftX  = cx - span/2;
+  const rightX = cx + span/2;
+
+  // F position: moves right as xi grows, up to the left-H bond distance
+  const fX = leftX + (rightX - leftX) * (0.10 + 0.35 * xi);
+  // Left H (the one F will bind to): roughly in middle, migrates slightly
+  const h1X = leftX + (rightX - leftX) * (0.50 + 0.05 * xi);
+  // Right H (the one ejected): moves right as xi grows past barrier
+  const h2X = leftX + (rightX - leftX) * (0.60 + 0.35 * Math.max(0, xi));
+
+  // bond lines (fade with xi)
+  ctx.lineCap = 'round';
+  // F–H1 bond forming (grows with xi)
+  ctx.strokeStyle = `rgba(106,169,255,${0.15 + 0.8*Math.min(1,xi)})`;
+  ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(fX, cy); ctx.lineTo(h1X, cy); ctx.stroke();
+  // H1–H2 bond breaking (fades with xi)
+  ctx.strokeStyle = `rgba(224,90,74,${0.15 + 0.8*Math.max(0,1-xi)})`;
+  ctx.beginPath(); ctx.moveTo(h1X, cy); ctx.lineTo(h2X, cy); ctx.stroke();
+
+  // orbital-ish halos (p-orbital on F, s on H)
+  ctx.fillStyle = 'rgba(212,194,122,0.08)';
+  ctx.beginPath(); ctx.ellipse(fX, cy, 28, 14, 0, 0, 2*Math.PI); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(fX, cy, 14, 28, 0, 0, 2*Math.PI); ctx.fill();
+
+  // atoms
+  function atom(x,y,r,fill,stroke,label) {
+    ctx.beginPath(); ctx.arc(x,y,r,0,2*Math.PI);
+    ctx.fillStyle = fill; ctx.fill();
+    ctx.strokeStyle = stroke; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#0b0d10'; ctx.font = 'bold 13px JetBrains Mono, monospace';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(label, x, y+1);
+  }
+  atom(fX,  cy, 16, '#d4c27a', '#8a7f4a', 'F');
+  atom(h1X, cy, 10, '#e8e6df', '#8a8a80', 'H');
+  atom(h2X, cy, 10, '#e8e6df', '#8a8a80', 'H');
+
+  // phase tag
+  ctx.fillStyle = phase === 'product' ? 'var(--good)'
+                : phase === 'transition' ? '#d4c27a' : '#8a8a80';
+  ctx.font = '10px JetBrains Mono, monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText(`ξ = ${xi.toFixed(3)}   [${phase}]`, 16, h-16);
+}
+
+// ————— BOTTOM PANE: V(ξ) curve with trajectory trail ———————————————————
+let trail = [];
+function drawEnergy(xi, v, E) {
+  const c = document.getElementById('energy');
+  const { ctx, w, h } = fitCanvas(c);
+  ctx.clearRect(0,0,w,h);
+  const margin = {l:60, r:20, t:30, b:40};
+  const pw = w - margin.l - margin.r;
+  const ph = h - margin.t - margin.b;
+
+  // y-range based on current potential shape
+  const Emin = Math.min(-Math.abs(state.dE) - 0.2, -0.2);
+  const Emax = Math.max(state.Ea + 0.5, 1.0);
+  const xToPx = x => margin.l + x * pw;
+  const yToPx = y => margin.t + (1 - (y-Emin)/(Emax-Emin)) * ph;
+
+  // axes
+  ctx.strokeStyle = '#2a2d33'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(margin.l, margin.t); ctx.lineTo(margin.l, margin.t+ph); ctx.lineTo(margin.l+pw, margin.t+ph); ctx.stroke();
+  // zero line
+  ctx.strokeStyle = '#1a1d22';
+  ctx.beginPath(); ctx.moveTo(margin.l, yToPx(0)); ctx.lineTo(margin.l+pw, yToPx(0)); ctx.stroke();
+  // axis labels
+  ctx.fillStyle = '#8a8a80'; ctx.font = '10px JetBrains Mono, monospace';
+  ctx.textAlign = 'right'; ctx.fillText('V(ξ)', margin.l-8, margin.t+8);
+  ctx.textAlign = 'center'; ctx.fillText('ξ   reaction coordinate', margin.l + pw/2, h-10);
+  ctx.textAlign = 'right';
+  ctx.fillText('reactants', margin.l-8, yToPx(0)+4);
+  ctx.fillText(state.dE.toFixed(1), margin.l-8, yToPx(state.dE)+4);
+  ctx.fillText(state.Ea.toFixed(1), margin.l-8, yToPx(state.Ea)+4);
+
+  // potential curve
+  ctx.strokeStyle = '#d4c27a'; ctx.lineWidth = 2;
+  ctx.beginPath();
+  for (let i=0; i<=200; i++) {
+    const x = i/200;
+    const y = V(x, state.Ea, state.dE);
+    const px = xToPx(x), py = yToPx(y);
+    if (i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py);
+  }
+  ctx.stroke();
+
+  // trail (past trajectory points)
+  ctx.strokeStyle = 'rgba(106,169,255,0.5)'; ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  trail.forEach((p,i) => {
+    const px = xToPx(Math.max(0,Math.min(1,p.xi)));
+    const py = yToPx(p.E);
+    if (i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py);
+  });
+  ctx.stroke();
+
+  // current point
+  if (!Number.isNaN(xi)) {
+    const px = xToPx(Math.max(0,Math.min(1,xi)));
+    const py = yToPx(E);
+    ctx.fillStyle = '#6aa9ff';
+    ctx.beginPath(); ctx.arc(px,py,5,0,2*Math.PI); ctx.fill();
+    ctx.strokeStyle = '#0b0d10'; ctx.lineWidth = 2; ctx.stroke();
+    // velocity vector
+    ctx.strokeStyle = 'rgba(106,169,255,0.8)'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(px,py); ctx.lineTo(px + v*8, py); ctx.stroke();
+  }
+
+  // barrier marker
+  const xBarrier = xToPx(0.5);
+  ctx.strokeStyle = 'rgba(212,194,122,0.25)'; ctx.setLineDash([3,3]);
+  ctx.beginPath(); ctx.moveTo(xBarrier, margin.t); ctx.lineTo(xBarrier, margin.t+ph); ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+// ————— RIGHT PANEL mini-charts ————————————————————————————————————————
+function drawHist() {
+  const c = document.getElementById('hist');
+  const { ctx, w, h } = fitCanvas(c);
+  ctx.clearRect(0,0,w,h);
+  if (state.histogram.length === 0) {
+    ctx.fillStyle = '#2a2d33'; ctx.font = '10px JetBrains Mono, monospace';
+    ctx.textAlign = 'center'; ctx.fillText('run a batch to populate', w/2, h/2);
+    return;
+  }
+  const bins = 20;
+  const min = 0.1, max = 4.0;
+  const hist = new Array(bins).fill(0);
+  state.histogram.forEach(e => {
+    const b = Math.min(bins-1, Math.max(0, Math.floor((e-min)/(max-min)*bins)));
+    hist[b]++;
+  });
+  const maxH = Math.max(...hist, 1);
+  const bw = w / bins;
+  hist.forEach((n,i) => {
+    const bh = (n/maxH) * (h-20);
+    ctx.fillStyle = '#e05a4a';
+    ctx.fillRect(i*bw+1, h-10-bh, bw-2, bh);
+  });
+  ctx.strokeStyle = '#2a2d33';
+  ctx.beginPath(); ctx.moveTo(0,h-10); ctx.lineTo(w,h-10); ctx.stroke();
+}
+
+function drawArr() {
+  const c = document.getElementById('arr');
+  const { ctx, w, h } = fitCanvas(c);
+  ctx.clearRect(0,0,w,h);
+  if (state.arrhenius.length === 0) {
+    ctx.fillStyle = '#2a2d33'; ctx.font = '10px JetBrains Mono, monospace';
+    ctx.textAlign = 'center'; ctx.fillText('batch across Eₖ to populate', w/2, h/2);
+    return;
+  }
+  const margin = {l:28, r:8, t:8, b:18};
+  const pw = w - margin.l - margin.r, ph = h - margin.t - margin.b;
+  const xMin = 0.1, xMax = 4.0;
+  const toPx = (x,y) => [margin.l + (x-xMin)/(xMax-xMin)*pw, margin.t + (1-y)*ph];
+  // axes
+  ctx.strokeStyle = '#2a2d33';
+  ctx.beginPath(); ctx.moveTo(margin.l, margin.t); ctx.lineTo(margin.l, margin.t+ph); ctx.lineTo(margin.l+pw, margin.t+ph); ctx.stroke();
+  // points
+  ctx.fillStyle = '#e05a4a';
+  state.arrhenius.forEach(p => {
+    const [px,py] = toPx(p.Ek, p.P);
+    ctx.beginPath(); ctx.arc(px,py,3,0,2*Math.PI); ctx.fill();
+  });
+  // simple connecting line (sorted)
+  const sorted = [...state.arrhenius].sort((a,b)=>a.Ek-b.Ek);
+  ctx.strokeStyle = 'rgba(224,90,74,0.4)'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  sorted.forEach((p,i) => {
+    const [px,py] = toPx(p.Ek, p.P);
+    if (i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py);
+  });
+  ctx.stroke();
+  // labels
+  ctx.fillStyle = '#8a8a80'; ctx.font = '9px JetBrains Mono, monospace';
+  ctx.textAlign = 'right'; ctx.fillText('1.0', margin.l-3, margin.t+6);
+  ctx.fillText('0.0', margin.l-3, margin.t+ph+3);
+  ctx.textAlign = 'center';
+  ctx.fillText('Eₖ', margin.l+pw/2, h-4);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  RUNS
+// ═══════════════════════════════════════════════════════════════════════════
+function log(kind, msg) {
+  const tick = document.getElementById('ticker');
+  const line = document.createElement('div');
+  line.className = 'log-line ' + kind;
+  const t = state.t.toString().padStart(4,'0');
+  const k = kind==='phi' ? 'ϕ→∃' : kind==='s' ? 's∃' : kind==='t' ? 'tϕ' : kind==='i' ? ' i ' : '···';
+  line.innerHTML = `<span class="t">${t}</span><span class="k">${k}</span><span class="m">${msg}</span>`;
+  tick.appendChild(line);
+  tick.scrollTop = tick.scrollHeight;
+}
+
+async function runSingle() {
+  if (state.running) return;
+  state.running = true;
+  trail = [];
+  log('phi', `initiate  Ek=${state.Ek.toFixed(2)}  b=${state.b.toFixed(2)}  Ea=${state.Ea.toFixed(2)}`);
+  const {samples, reacted, Eeff} = runTrajectory({
+    Ea: state.Ea, dE: state.dE, Ek: state.Ek, b: state.b
+  });
+  // animate
+  for (let i=0; i<samples.length; i++) {
+    const s = samples[i];
+    state.t = Math.round(s.t * 100)/100;
+    state.xi = s.xi;
+    state.vxi = s.v;
+    trail.push(s);
+    document.getElementById('state-read').innerHTML =
+      `step <b>${i}</b> &nbsp;·&nbsp; t = <b>${state.t.toFixed(2)}</b> fs<br>` +
+      `ξ = <b>${s.xi.toFixed(3)}</b> &nbsp;·&nbsp; v = <b>${s.v.toFixed(3)}</b><br>` +
+      `phase: <b>${s.phase.toUpperCase()}</b>`;
+    drawAtoms(Math.max(0,Math.min(1,s.xi)), s.phase);
+    drawEnergy(s.xi, s.v, s.E);
+    if (i % 40 === 0) log('i', `ξ=${s.xi.toFixed(3)}  v=${s.v.toFixed(3)}  [${s.phase}]`);
+    await new Promise(r => setTimeout(r, 8));
+  }
+  log(reacted ? 'phi' : 's', reacted
+    ? `∃ = PRODUCT  (reacted, HF + H formed)`
+    : `∃ = REACTANT  (no crossing — Ek < Ea - 0.5b²)`);
+  state.running = false;
+}
+
+async function runBatch() {
+  if (state.running) return;
+  state.running = true;
+  state.iter++;
+  log('i', `───── iteration i = ${state.iter} ─────`);
+  log('s',  `begin batch: 200 trials sampled over Ek ∈ [0.1, 4.0]`);
+  const N = 200;
+  // clear the Arrhenius bins we're about to refill
+  const bins = {};
+  for (let n=0; n<N; n++) {
+    const Ek = 0.1 + Math.random() * 3.9;
+    const b  = (Math.random()-0.5) * 1.5;
+    const {reacted} = runTrajectory({ Ea: state.Ea, dE: state.dE, Ek, b });
+    state.trial++;
+    if (reacted) {
+      state.reactions++;
+      state.histogram.push(Ek);
+    }
+    const bIdx = Math.floor(Ek / 0.4);
+    if (!bins[bIdx]) bins[bIdx] = {n:0, r:0, Ek: (bIdx+0.5)*0.4};
+    bins[bIdx].n++; if (reacted) bins[bIdx].r++;
+
+    if (n % 20 === 0) {
+      document.getElementById('v-n').textContent = state.trial;
+      document.getElementById('v-r').textContent = state.reactions;
+      document.getElementById('v-p').textContent = (state.reactions/state.trial).toFixed(3);
+      document.getElementById('v-i').textContent = state.iter;
+      drawHist();
+      await new Promise(r => setTimeout(r, 1));
+    }
+  }
+  // compile per-bin P(reaction) and append as a new iteration's curve
+  state.arrhenius = Object.values(bins).map(b => ({Ek: b.Ek, P: b.r/b.n}));
+  drawHist(); drawArr();
+
+  // ───── INDUCTIVE REFINEMENT: fit Ea from the low-Ek tail ─────
+  // P(reaction) ≈ H(Ek - Ea_eff)  →  estimate Ea_eff from threshold
+  const sorted = [...state.arrhenius].sort((a,b)=>a.Ek-b.Ek);
+  let fit = null;
+  for (const p of sorted) { if (p.P >= 0.3) { fit = p.Ek; break; } }
+  if (fit !== null) {
+    document.getElementById('v-fit-ea').textContent = fit.toFixed(2);
+    document.getElementById('v-arr').textContent = `exp(-${state.Ea.toFixed(2)}/Ek)`;
+    const err = Math.abs(fit - state.Ea);
+    log('t', `tϕ refined: fitted Ea ≈ ${fit.toFixed(2)}  (true ${state.Ea.toFixed(2)}, err ${err.toFixed(2)})`);
+    log('i', `s∃ ⟳ tϕ  converging — iteration i=${state.iter} complete`);
+  } else {
+    log('t', `tϕ refined: insufficient reactive trials, raise Ek range`);
+  }
+  state.running = false;
+}
+
+function resetAll() {
+  state.t = 0; state.xi = 0; state.vxi = 0;
+  state.trial = 0; state.reactions = 0; state.iter = 0;
+  state.histogram = []; state.arrhenius = [];
+  trail = [];
+  document.getElementById('ticker').innerHTML =
+    '<h3>Reasoning trace  ·  i = iteration, ϕ = theory update, ∃ = outcome</h3>';
+  document.getElementById('v-n').textContent = '0';
+  document.getElementById('v-r').textContent = '0';
+  document.getElementById('v-p').textContent = '—';
+  document.getElementById('v-i').textContent = '0';
+  document.getElementById('v-fit-ea').textContent = '—';
+  document.getElementById('v-arr').textContent = '—';
+  document.getElementById('state-read').innerHTML =
+    `step <b>0</b> &nbsp;·&nbsp; t = <b>0.00</b> fs<br>r(F–H) = <b>—</b> &nbsp;·&nbsp; r(H–H) = <b>—</b><br>status: <b>IDLE</b>`;
+  drawAtoms(0, 'reactant');
+  drawEnergy(NaN, 0, 0);
+  drawHist(); drawArr();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  WIRE UP
+// ═══════════════════════════════════════════════════════════════════════════
+function bindSlider(id, key, fmt=(v=>v.toFixed(2))) {
+  const s = document.getElementById('s-'+id);
+  const v = document.getElementById('v-'+id);
+  s.addEventListener('input', () => {
+    state[key] = parseFloat(s.value);
+    v.textContent = fmt(state[key]);
+    drawEnergy(state.xi, state.vxi, V(state.xi, state.Ea, state.dE));
+  });
+}
+bindSlider('ea','Ea');
+bindSlider('de','dE');
+bindSlider('ek','Ek');
+bindSlider('b','b');
+
+document.getElementById('run-one').addEventListener('click', runSingle);
+document.getElementById('run-batch').addEventListener('click', runBatch);
+document.getElementById('reset').addEventListener('click', resetAll);
+
+document.getElementById('mode-phi').addEventListener('click', () => {
+  document.getElementById('mode-phi').classList.add('on');
+  document.getElementById('mode-s').classList.remove('on');
+  state.mode = 'phi';
+});
+document.getElementById('mode-s').addEventListener('click', () => {
+  document.getElementById('mode-s').classList.add('on');
+  document.getElementById('mode-phi').classList.remove('on');
+  state.mode = 's';
+});
+
+window.addEventListener('resize', () => {
+  drawAtoms(state.xi || 0, 'reactant');
+  drawEnergy(state.xi, state.vxi, V(state.xi, state.Ea, state.dE));
+  drawHist(); drawArr();
+});
+
+// initial paint
+resetAll();
+log('phi', 'system initialized — F + H₂ collinear approach');
+log('t',   'theory tϕ₀:  Ea=1.60, ΔE=-1.40  (editable in left panel)');
+log('i',   'awaiting instruction — hit ϕ→∃ for a single trajectory or s∃⟳tϕ for a batch');
+</script>
+</body>
+</html>

@@ -1,0 +1,79 @@
+# Phytologue — unified conda environment
+#
+# Works on:
+#   • macOS (Apple Silicon, osx-arm64) — PyTorch MPS available at runtime
+#   • Linux (x86_64) — CPU execution only (no CUDA install by design)
+#
+# One environment, two platforms. The code picks the device at runtime.
+#
+# Install with mamba (via miniforge), NOT plain conda — plain conda's solver
+# cannot handle this stack in reasonable time:
+#
+#     mamba env create -f environment.yml
+#     mamba activate phytologue
+#
+# Notes:
+#   • `cpuonly` is intentionally omitted. On Linux this means PyTorch's CUDA
+#     libs come along for the ride but are never invoked. On macOS it means
+#     MPS remains available.
+#   • Do not add `pytorch-cuda` here. If you later want CUDA on a Linux GPU
+#     node, create a separate `environment-cuda.yml`.
+#   • Heavy ML weights (ESMFold, ESM-2, MACE-OFF23) are NOT in this file.
+#     They're downloaded on first run into ./models/ — see `make weights`.
+
+name: phytologue
+channels:
+  - pytorch
+  - conda-forge
+  - bioconda
+
+dependencies:
+  # ─── Core ───────────────────────────────────────────────
+  - python=3.11
+  - pip
+  - mamba
+
+  # ─── Web backend ────────────────────────────────────────
+  - fastapi
+  - uvicorn
+  - httpx
+  - pydantic
+  - sse-starlette
+
+  # ─── Scientific core ────────────────────────────────────
+  - numpy
+  - scipy
+  - pandas
+  - scikit-learn
+  - numba
+  - matplotlib
+
+  # ─── Structural bio ─────────────────────────────────────
+  - mdanalysis
+  - biopython
+  - openmm
+  - pdbfixer
+  - openff-toolkit
+  - rdkit
+
+  # ─── PyTorch (MPS on Mac, CPU on Linux) ─────────────────
+  - pytorch::pytorch
+  - pytorch::torchvision
+  - pytorch::torchaudio
+
+  # ─── Bio/chem ML ────────────────────────────────────────
+  - fair-esm          # ESM-2 and ESMFold
+
+  # ─── Pocket detection / docking ─────────────────────────
+  - p2rank
+  - vina
+  - openjdk=17        # required by P2Rank
+
+  # ─── Dynamics / statistics ──────────────────────────────
+  - deeptime
+
+  # ─── pip-only dependencies (install last) ───────────────
+  - pip:
+      - mace-torch          # MACE-OFF ML potential
+      - openmm-ml           # bridges OpenMM <-> PyTorch
+      - scikit-optimize     # Bayesian acquisition for active learning
