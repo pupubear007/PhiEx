@@ -1,8 +1,8 @@
 # PhiEx Sandbox v0
 
 A web-based workbench for real-time visual simulation of in planta and
-in vitro biomolecular systems, framed in the φ → ∃ / s∃ ⟳ tφ vocabulary
-of *Wang 2025*. v0 is the minimum viable vertical slice — every stage
+in vitro biomolecular systems, framed in the φ → ∃ / s∃ ⟳ tφ vocabulary.
+v0 is the minimum viable vertical slice — every stage
 of the real pipeline runs end-to-end for a single example (plant
 ascorbate peroxidase, APX), with ML integrated from stage 1 and not
 bolted on later.
