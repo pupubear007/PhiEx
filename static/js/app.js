@@ -185,6 +185,9 @@ async function loadPdbInto(containerId, pdbText, opts={}){
     console.warn("[viewer] empty pdb_text — nothing to render");
     return;
   }
+  // Stash the PDB so the highlight feature can filter it later without
+  // having to re-fetch from the server.
+  _pdbCache.set(containerId, pdbText);
   return _withLock(containerId, async () => {
     const viewer = (containerId === "viewer-pred") ? predViewer : expViewer;
     if (!viewer) {
@@ -264,6 +267,15 @@ async function postJSON(url, body={}){
 
 let lastStruct = null, lastPockets = null, lastPoses = null, lastDyn = null;
 let lastAL = [];
+let lastDiscoveries = [];   // disagreement residues from ESM-2 cross-check
+
+// Cache the *raw PDB text* of whatever's currently in each viewer.  The
+// highlight feature filters this down to a subset and loads the result as
+// a SECOND structure on top — which dodges Mol*'s notoriously fragile
+// expression-based selection API entirely.
+const _pdbCache = new Map();          // containerId → pdb text
+// Per-viewer cleanup handles for the highlight overlay.
+const _highlightCells = new Map();    // containerId → array of state cells / refs
 
 $("#run-structure").addEventListener("click", async () => {
   const pdb = $("#i-pdb").value.trim();
@@ -419,6 +431,9 @@ async function resetAll(){
   // 3. frontend caches
   lastStruct = null; lastPockets = null; lastPoses = null; lastDyn = null;
   lastAL = [];
+  lastDiscoveries = [];
+  _highlightCells.clear();
+  _pdbCache.clear();
 
   // 4. side-panel readouts — restore initial empty messages
   $("#phi0-readout").innerHTML       = "no annotations yet — run stage 2";
@@ -449,6 +464,160 @@ async function resetAll(){
   console.log("[reset] full reset complete");
 }
 $("#clear-3d").addEventListener("click", resetAll);
+
+// ─────────────────────────────────────────────────────────────────────────
+// Highlight "discovery flags" — disagreement residues from the ESM-2
+// cross-check — in both 3D viewers as red ball-and-stick.
+//
+// Mol*'s public API for adding a representation on a residue selection
+// varies across 4.x point releases.  We use the most stable path:
+//   1. grab the structure cell that's already loaded
+//   2. build a MolScript expression selecting whole residues whose
+//      auth_seq_id is in the discovery set
+//   3. call plugin.builders.structure.representation.addRepresentation
+//      with type=ball-and-stick and a uniform red color
+//
+// If anything goes wrong we log to console (for debugging) and surface
+// a sys-line in the on-screen ticker so the user knows nothing happened.
+// ─────────────────────────────────────────────────────────────────────────
+// Filter a PDB text to only ATOM/HETATM lines whose residue sequence id
+// is in the given set.  PDB column layout (1-based): cols 23-26 = resSeq.
+// We also keep TER and END so the resulting fragment is a valid PDB.
+function _filterPdbByResidues(pdbText, residueSet){
+  const out = [];
+  for (const line of pdbText.split(/\r?\n/)) {
+    if (line.startsWith("ATOM") || line.startsWith("HETATM")) {
+      const n = parseInt(line.substring(22, 26).trim(), 10);
+      if (!isNaN(n) && residueSet.has(n)) out.push(line);
+    } else if (line.startsWith("TER") || line.startsWith("END")) {
+      // skip — we'll add a single END at the end
+    }
+  }
+  if (!out.length) return null;
+  out.push("END");
+  return out.join("\n");
+}
+
+// Add a "discovery overlay" — a second tiny structure containing only the
+// flagged residues, rendered as red ball-and-stick on top of the existing
+// cartoon.  This sidesteps Mol*'s expression-based selection API by using
+// the well-supported parseTrajectory → createModel → createStructure
+// pipeline that's part of plugin.builders.structure.  Works on every
+// Mol* 4.x build I've encountered.
+async function _addDiscoveryHighlight(containerId, residues){
+  const viewer = (containerId === "viewer-pred") ? predViewer : expViewer;
+  if (!viewer || !viewer.plugin) {
+    console.warn(`[highlight] ${containerId} viewer/plugin missing`);
+    return false;
+  }
+  const plugin = viewer.plugin;
+  const original = _pdbCache.get(containerId);
+  if (!original) {
+    console.warn(`[highlight] no cached PDB for ${containerId} — load a structure first`);
+    return false;
+  }
+  const residueSet = new Set(residues.map(r => parseInt(r, 10)).filter(n => !isNaN(n)));
+  if (!residueSet.size) {
+    console.warn("[highlight] empty residue set");
+    return false;
+  }
+  const filtered = _filterPdbByResidues(original, residueSet);
+  if (!filtered) {
+    console.warn(`[highlight] no atoms matched residues on ${containerId}; flagged=`, residues);
+    return false;
+  }
+  console.log(`[highlight] ${containerId}: filtered overlay = ${filtered.split("\n").length} lines`);
+
+  try {
+    // Low-level structure-creation pipeline.  Each step returns a state
+    // cell whose `.ref` we can later delete to remove the overlay.
+    const data = await plugin.builders.data.rawData({
+      data: filtered,
+      label: "discovery-flags-data",
+    });
+    const trajectory = await plugin.builders.structure.parseTrajectory(data, "pdb");
+    const model      = await plugin.builders.structure.createModel(trajectory);
+    const structure  = await plugin.builders.structure.createStructure(model);
+
+    // Attach a red ball-and-stick representation directly to the new
+    // structure.  Because the structure ONLY contains the flagged
+    // residues, no selection step is needed — every atom in this branch
+    // is a discovery atom.
+    await plugin.builders.structure.representation.addRepresentation(structure, {
+      type: "ball-and-stick",
+      color: "uniform",
+      colorParams: { value: 0xe05a4a },     // red — matches --s
+      sizeParams: { scale: 1.4 },
+    });
+    // A larger sphere makes it pop out from the cartoon.
+    try {
+      await plugin.builders.structure.representation.addRepresentation(structure, {
+        type: "spacefill",
+        color: "uniform",
+        colorParams: { value: 0xe05a4a },
+        sizeParams: { scale: 0.45 },
+      });
+    } catch(_) { /* not all builds support spacefill addition this way */ }
+
+    // Track the root data cell — deleting it cascades to all children.
+    const list = _highlightCells.get(containerId) || [];
+    list.push(data);
+    _highlightCells.set(containerId, list);
+    console.log(`[highlight] ${containerId}: overlay attached`);
+    return true;
+  } catch (e) {
+    console.error(`[highlight] overlay creation failed on ${containerId}:`, e);
+    return false;
+  }
+}
+
+async function _clearDiscoveryHighlights(containerId){
+  const viewer = (containerId === "viewer-pred") ? predViewer : expViewer;
+  if (!viewer || !viewer.plugin) return;
+  const plugin = viewer.plugin;
+  const cells = _highlightCells.get(containerId) || [];
+  for (const cell of cells) {
+    // The overlay's "data" cell is the root of a parseTrajectory chain.
+    // Deleting it from the state tree cascades through all children.
+    const ref = (cell && cell.ref) || (cell && cell.transform && cell.transform.ref) || null;
+    if (!ref) {
+      console.warn(`[highlight] no ref on cached cell for ${containerId}`);
+      continue;
+    }
+    try {
+      await plugin.state.data.build().delete(ref).commit();
+      console.log(`[highlight] removed overlay ${ref} on ${containerId}`);
+    } catch (e) {
+      console.warn(`[highlight] state delete failed for ${ref}:`, e);
+    }
+  }
+  _highlightCells.delete(containerId);
+}
+
+async function highlightDiscoveryResidues(){
+  if (!lastDiscoveries || !lastDiscoveries.length) {
+    logSys("no discovery flags yet — run end-to-end first");
+    return;
+  }
+  if (viewersReady) await viewersReady;
+  // Toggle: if either viewer already has highlights, clear both first.
+  if (_highlightCells.has("viewer-pred") || _highlightCells.has("viewer-exp")) {
+    console.log("[highlight] clearing existing highlights");
+    await _clearDiscoveryHighlights("viewer-pred");
+    await _clearDiscoveryHighlights("viewer-exp");
+    logSys("discovery-flag highlights cleared");
+    return;
+  }
+  console.log("[highlight] adding highlights for residues:", lastDiscoveries);
+  const okPred = await _addDiscoveryHighlight("viewer-pred", lastDiscoveries);
+  const okExp  = await _addDiscoveryHighlight("viewer-exp",  lastDiscoveries);
+  if (okPred || okExp) {
+    logSys(`★ discovery flags highlighted: R${lastDiscoveries.join(", R")}`);
+  } else {
+    logSys("highlight failed — see console (Mol* version mismatch?)");
+  }
+}
+$("#highlight-disc").addEventListener("click", highlightDiscoveryResidues);
 
 $("#run-all").addEventListener("click", async () => {
   // Streamed end-to-end run — server emits SSE events, the ticker shows
@@ -631,6 +800,10 @@ function renderResult(r){
   $("#cross-readout").innerHTML =
     `agreement: ${(r.agreement_residues||[]).map(x=>`<span class="residue-pill agree">R${x}</span>`).join("") || "—"}<br>` +
     `disagreement (discovery flags): ${(r.disagreement_residues||[]).map(x=>`<span class="residue-pill disagree">R${x}</span>`).join("") || "—"}`;
+
+  // remember the discovery-flag residues so the user can light them up in 3D
+  lastDiscoveries = (r.disagreement_residues || []).slice();
+  console.log("[discovery] flagged residues:", lastDiscoveries);
 
   refreshTheories();
 }
