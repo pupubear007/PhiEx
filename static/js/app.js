@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────
-// Phytologue Sandbox v0 — frontend.
+// PhiEx Sandbox v0 — frontend.
 //
 // Visual vocabulary preserved from the prototype:
 //     ϕ / ∃ / s / tϕ / i  symbols labelling pipeline stages

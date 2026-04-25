@@ -1,1 +1,1 @@
-"""FastAPI app — phytologue.app."""
+"""FastAPI app — PhiEx.app."""

@@ -1,5 +1,5 @@
 """
-app.main — FastAPI backend for the Phytologue Sandbox.
+app.main — FastAPI backend for the PhiEx Sandbox.
 
 Routes:
     GET  /                 → static frontend (index.html in static/)
@@ -33,29 +33,29 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, Fil
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from phytologue.ticker import TICKER, log
-from phytologue.device import select_device, describe_device, select_openmm_platform
-from phytologue.core.theory import THEORIES
-from phytologue.pipeline.apx import APXPipeline, APX_DEFAULT_PDB
+from PhiEx.ticker import TICKER, log
+from PhiEx.device import select_device, describe_device, select_openmm_platform
+from PhiEx.core.theory import THEORIES
+from PhiEx.pipeline.apx import APXPipeline, APX_DEFAULT_PDB
 
 # adapters used by the per-stage routes
-from phytologue.adapters.pdb import fetch_protein, parse_pdb_text
-from phytologue.adapters.esmfold import ESMFoldAdapter, ca_rmsd
-from phytologue.adapters.esm2 import ESM2Adapter, attention_residue_importance
-from phytologue.adapters.foldseek import FoldseekAdapter, aggregate_go_terms
-from phytologue.adapters.p2rank import P2RankAdapter
-from phytologue.adapters.vina import VinaAdapter, ASCORBATE
-from phytologue.adapters.diffdock import DiffDockAdapter
-from phytologue.adapters.openmm_calc import OpenMMSimulator
-from phytologue.adapters.mace import MACEAdapter, select_active_site_region
-from phytologue.adapters.surrogate import GBRSurrogate, encode_perturbation
-from phytologue.al import ActiveLearningLoop, UCBAcquisition, generate_mutation_panel
+from PhiEx.adapters.pdb import fetch_protein, parse_pdb_text
+from PhiEx.adapters.esmfold import ESMFoldAdapter, ca_rmsd
+from PhiEx.adapters.esm2 import ESM2Adapter, attention_residue_importance
+from PhiEx.adapters.foldseek import FoldseekAdapter, aggregate_go_terms
+from PhiEx.adapters.p2rank import P2RankAdapter
+from PhiEx.adapters.vina import VinaAdapter, ASCORBATE
+from PhiEx.adapters.diffdock import DiffDockAdapter
+from PhiEx.adapters.openmm_calc import OpenMMSimulator
+from PhiEx.adapters.mace import MACEAdapter, select_active_site_region
+from PhiEx.adapters.surrogate import GBRSurrogate, encode_perturbation
+from PhiEx.al import ActiveLearningLoop, UCBAcquisition, generate_mutation_panel
 
-from phytologue.core.state import (Atom, Residue, Protein, Cofactor,
+from PhiEx.core.state import (Atom, Residue, Protein, Cofactor,
                                    Ligand, ComplexState, Pocket)
 
 
-app = FastAPI(title="Phytologue Sandbox v0",
+app = FastAPI(title="PhiEx Sandbox v0",
               version="0.1.0",
               description="ϕ→∃ / s∃⟳tϕ workbench for in planta / in vitro biomolecular ML")
 
@@ -94,7 +94,7 @@ async def root() -> HTMLResponse:
     if idx.exists():
         return HTMLResponse(idx.read_text())
     return HTMLResponse(
-        "<h1>Phytologue Sandbox v0</h1><p>Frontend not built (static/index.html missing).</p>",
+        "<h1>PhiEx Sandbox v0</h1><p>Frontend not built (static/index.html missing).</p>",
         status_code=200)
 
 
@@ -290,7 +290,7 @@ async def api_dynamics(req: DynamicsRequest):
         }
 
     # analysis
-    from phytologue.analysis import (ligand_residue_contacts, contact_frequency,
+    from PhiEx.analysis import (ligand_residue_contacts, contact_frequency,
                                       rmsf_per_residue, residence_time)
     contacts = ligand_residue_contacts(traj)
     out["top_contacts"] = contact_frequency(contacts, top_k=10)
@@ -324,7 +324,7 @@ async def api_al(req: ALRequest):
 
     # evaluator: cheap synthetic for the API path; real evaluator is wired
     # by run_apx_pipeline.  README documents the swap.
-    from phytologue.runners.batch import synthetic_evaluator
+    from PhiEx.runners.batch import synthetic_evaluator
     loop = SESSION.get("al_loop")
     if loop is None or not getattr(surrogate, "_trained", False):
         loop = ActiveLearningLoop(surrogate=surrogate, evaluator=synthetic_evaluator,

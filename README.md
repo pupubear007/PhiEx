@@ -1,4 +1,4 @@
-# Phytologue Sandbox v0
+# PhiEx Sandbox v0
 
 A web-based workbench for real-time visual simulation of in planta and
 in vitro biomolecular systems, framed in the φ → ∃ / s∃ ⟳ tφ vocabulary
@@ -43,7 +43,7 @@ ML models *are* the refined theory tφ. Not "models we use for prediction"
    `<value> ± <uncertainty>`.
 
 3. **They are updated by iteration `i`.** The active-learning loop
-   (`phytologue/al/loop.py`) is what advances the theory. Each `i ← i+1`
+   (`PhiEx/al/loop.py`) is what advances the theory. Each `i ← i+1`
    takes the current surrogate (one entry in `theories`), uses an
    acquisition function to pick the next perturbation, runs an
    evaluator, and refits. The UI's "run next iteration" button is
@@ -167,7 +167,7 @@ stdin and write JSON to stdout — Slurm-ready by construction.
 
 ```
 git clone <repo> && cd <repo>
-make env       # creates conda env "phytologue", ~20 min, ~5 GB
+make env       # creates conda env "PhiEx", ~20 min, ~5 GB
 make weights   # ~5 GB download for ESMFold + ESM-2 + MACE-OFF23
 make run       # http://localhost:8000
 ```
@@ -176,14 +176,14 @@ make run       # http://localhost:8000
 
 ```
 git clone <repo> && cd <repo>
-mkdir -p /scratch.global/$USER/phytologue   # group-space env recommended
-mamba env create -f environment.yml -p /scratch.global/$USER/phytologue
-mamba activate /scratch.global/$USER/phytologue
+mkdir -p /scratch.global/$USER/PhiEx   # group-space env recommended
+mamba env create -f environment.yml -p /scratch.global/$USER/PhiEx
+mamba activate /scratch.global/$USER/PhiEx
 make weights
-PHYTOLOGUE_DEVICE=cpu make run
+PHIEX_DEVICE=cpu make run
 ```
 
-The same `environment.yml` works on both platforms; `phytologue.device`
+The same `environment.yml` works on both platforms; `PhiEx.device`
 picks the right runtime device. `PYTORCH_ENABLE_MPS_FALLBACK=1` is set
 by `make run` so unsupported MPS ops fall through to CPU instead of
 raising.
@@ -282,10 +282,10 @@ The simulator-shaped runner is `runners/readdy_simulator.py` mirroring
 
 ```python
 def select_device(override=None):
-    forced = override or os.environ.get("PHYTOLOGUE_DEVICE")
+    forced = override or os.environ.get("PHIEX_DEVICE")
     if forced == "cuda":
         if not torch.cuda.is_available():
-            raise RuntimeError("PHYTOLOGUE_DEVICE=cuda but no CUDA")
+            raise RuntimeError("PHIEX_DEVICE=cuda but no CUDA")
         return "cuda"
     if torch.backends.mps.is_available(): return "mps"
     return "cpu"
@@ -325,7 +325,7 @@ PhiEx/
 ├── app/
 │   ├── __init__.py
 │   └── main.py           FastAPI backend with SSE streaming
-├── phytologue/
+├── PhiEx/
 │   ├── __init__.py
 │   ├── device.py         re-export of root device.py
 │   ├── ticker.py         reasoning-ticker pub/sub

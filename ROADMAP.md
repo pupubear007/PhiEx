@@ -1,4 +1,4 @@
-# Phytologue — Roadmap
+# PhiEx — Roadmap
 
 The v0 sandbox is a vertical slice through every stage of the pipeline,
 correctly architected and stubbed where the production tool is too heavy
@@ -21,7 +21,7 @@ provenance badge in the predicted-structure pane. `adapters/pdb.py` and
 
 ## 2.  `ReaDDyAdapter` for cell-compartment reaction-diffusion (★)
 
-Add `phytologue/adapters/readdy.py` wearing the `Calculator` coat at the
+Add `PhiEx/adapters/readdy.py` wearing the `Calculator` coat at the
 particle/CG level: positions are particle-CoMs, "energies" are reaction
 events, "forces" are particle-particle interaction kernels.  The
 `ComplexState` extension is to allow `entities: list[Particle]` alongside
@@ -75,7 +75,7 @@ with uncertainty crosses.
 
 The current rule is "MPS on Mac, CPU on Linux".  When MSI GPU nodes are
 ready, add a CUDA arm to `select_device()` gated on
-`PHYTOLOGUE_DEVICE=cuda` *or* a positive `PHYTOLOGUE_GPU=1` flag.  Add
+`PHIEX_DEVICE=cuda` *or* a positive `PHIEX_GPU=1` flag.  Add
 an `environment-cuda.yml` (separate from the cross-platform
 `environment.yml`) that pins `pytorch-cuda` to the cluster's driver.
 
@@ -88,7 +88,7 @@ the wrappers themselves are tiny:
 # scripts/slurm_dock.sh
 #!/usr/bin/env bash
 #SBATCH ...
-cat $1 | python -m phytologue.runners.docker > $2
+cat $1 | python -m PhiEx.runners.docker > $2
 ```
 
 Write three wrappers — one per runner.  Add a `scripts/submit.py` that

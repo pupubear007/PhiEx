@@ -1,4 +1,4 @@
-# Getting Started — Phytologue Sandbox
+# Getting Started — PhiEx Sandbox
 
 A friendly walkthrough for someone opening this folder for the first time.
 
@@ -11,7 +11,7 @@ actually means.
 
 ## 1.  What is this thing?
 
-Phytologue is a small web app that simulates a plant enzyme called
+PhiEx is a small web app that simulates a plant enzyme called
 **ascorbate peroxidase (APX)** all the way from "we have a sequence of
 amino acids" to "we have predicted which residues control the catalytic
 chemistry."  It runs in your browser, talks to a Python backend on your
@@ -42,7 +42,7 @@ You need:
 In a terminal, from the folder this file is in:
 
 ```bash
-make env       # creates a conda env called `phytologue`
+make env       # creates a conda env called `PhiEx`
 make weights   # OPTIONAL — downloads ESMFold, ESM-2, MACE.  Skip for stub-only.
 make run       # starts the web app at  http://localhost:8000
 ```
@@ -188,7 +188,7 @@ system has rediscovered known biology, blind, from a sequence.
 
 ## 7.  Where to go next
 
-* **Try a different protein.**  Edit `phytologue/adapters/pdb.py` to
+* **Try a different protein.**  Edit `PhiEx/adapters/pdb.py` to
   change `APX_DEFAULT_PDB` and `APX_DEFAULT_UNIPROT`.  Anything with a
   cofactor and a small-molecule substrate will work; without a
   cofactor, the active-site heuristic just won't fire.

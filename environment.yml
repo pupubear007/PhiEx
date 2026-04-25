@@ -1,4 +1,4 @@
-# Phytologue — unified conda environment
+# PhiEx — unified conda environment
 #
 # Works on:
 #   • macOS (Apple Silicon, osx-arm64) — PyTorch MPS available at runtime
@@ -10,7 +10,7 @@
 # cannot handle this stack in reasonable time:
 #
 #     mamba env create -f environment.yml
-#     mamba activate phytologue
+#     mamba activate PhiEx
 #
 # Notes:
 #   • `cpuonly` is intentionally omitted. On Linux this means PyTorch's CUDA
@@ -21,7 +21,7 @@
 #   • Heavy ML weights (ESMFold, ESM-2, MACE-OFF23) are NOT in this file.
 #     They're downloaded on first run into ./models/ — see `make weights`.
 
-name: phytologue
+name: PhiEx
 channels:
   - pytorch
   - conda-forge

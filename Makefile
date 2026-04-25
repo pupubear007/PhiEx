@@ -1,4 +1,4 @@
-# Phytologue — developer entry points
+# PhiEx — developer entry points
 #
 # Usage:
 #   make env       Create the conda environment (one-time, ~20 min)
@@ -10,7 +10,7 @@
 # Requires miniforge (mamba). If `mamba` isn't on PATH, install from
 # https://github.com/conda-forge/miniforge  before running `make env`.
 
-ENV_NAME     := phytologue
+ENV_NAME     := PhiEx
 MODELS_DIR   := ./models
 DATA_DIR     := ./data
 PYTHON       := mamba run -n $(ENV_NAME) python
@@ -19,7 +19,7 @@ UVICORN      := mamba run -n $(ENV_NAME) uvicorn
 .PHONY: env weights run test clean help
 
 help:
-	@echo "Phytologue — make targets:"
+	@echo "PhiEx — make targets:"
 	@echo "  env      create conda environment '$(ENV_NAME)'"
 	@echo "  weights  download ML weights to $(MODELS_DIR)"
 	@echo "  run      launch FastAPI backend at http://localhost:8000"
@@ -39,16 +39,16 @@ $(MODELS_DIR):
 	mkdir -p $(MODELS_DIR)
 
 run:
-	@echo "==> starting phytologue at http://localhost:8000"
+	@echo "==> starting PhiEx at http://localhost:8000"
 	PYTORCH_ENABLE_MPS_FALLBACK=1 \
-	PHYTOLOGUE_MODELS_DIR=$(MODELS_DIR) \
+	PHIEX_MODELS_DIR=$(MODELS_DIR) \
 	$(UVICORN) app.main:app --reload --host 127.0.0.1 --port 8000
 
 test:
 	@echo "==> running APX end-to-end sandbox"
 	PYTORCH_ENABLE_MPS_FALLBACK=1 \
-	PHYTOLOGUE_MODELS_DIR=$(MODELS_DIR) \
-	$(PYTHON) -m phytologue.tests.apx_end_to_end
+	PHIEX_MODELS_DIR=$(MODELS_DIR) \
+	$(PYTHON) -m PhiEx.tests.apx_end_to_end
 
 clean:
 	@echo "==> removing __pycache__, .pytest_cache, trajectory scratch"
