@@ -73,23 +73,36 @@ def list_pdbs_for_uniprot(uniprot_id: str, timeout: float = 10.0) -> list[dict]:
         log("sys", f"UniProt lookup failed: {e}")
         return []
     out: list[dict] = []
+    af_from_xref: Optional[dict] = None
     for x in data.get("uniProtKBCrossReferences", []):
-        if x.get("database") != "PDB":
-            continue
-        props = {p["key"]: p["value"] for p in x.get("properties", [])}
-        # resolution comes as e.g. "1.70 A" — extract the float
-        res_str = props.get("Resolution", "") or ""
-        res_val = None
-        try:
-            res_val = float(res_str.split()[0])
-        except Exception:
-            pass
-        out.append({
-            "pdb_id":     x.get("id", ""),
-            "method":     props.get("Method", ""),
-            "resolution": res_val,
-            "chains":     props.get("Chains", ""),
-        })
+        db = x.get("database")
+        if db == "PDB":
+            props = {p["key"]: p["value"] for p in x.get("properties", [])}
+            # resolution comes as e.g. "1.70 A" — extract the float
+            res_str = props.get("Resolution", "") or ""
+            res_val = None
+            try:
+                res_val = float(res_str.split()[0])
+            except Exception:
+                pass
+            out.append({
+                "pdb_id":     x.get("id", ""),
+                "method":     props.get("Method", ""),
+                "resolution": res_val,
+                "chains":     props.get("Chains", ""),
+            })
+        elif db == "AlphaFoldDB" and af_from_xref is None:
+            # UniProt is the authoritative source for which AF prediction
+            # exists for this accession. The xref id looks like the bare
+            # accession (e.g. "P13006"); the full model id is AF-<acc>-F1.
+            af_id = x.get("id") or uniprot_id
+            af_from_xref = {
+                "pdb_id":     f"AF:{af_id}",
+                "method":     "AlphaFold (predicted)",
+                "resolution": None,
+                "chains":     "",
+                "_source":    "uniprot_xref",
+            }
     # sort: x-ray first by resolution asc, then NMR / EM, then unknown
     def _key(r):
         method_rank = 0 if "X-ray" in (r["method"] or "") else 1
@@ -103,9 +116,23 @@ def list_pdbs_for_uniprot(uniprot_id: str, timeout: float = 10.0) -> list[dict]:
     sm = _swissmodel_summary(uniprot_id)
     if sm:
         out.append(sm)
-    af = _alphafold_summary(uniprot_id)
-    if af:
-        out.append(af)
+    # AlphaFold: prefer the UniProt xref (no extra HTTP call, always-current
+    # version). Fall back to the standalone probe if the xref is missing
+    # (some accessions have an AF model but no xref yet).
+    if af_from_xref is not None:
+        af_from_xref.pop("_source", None)
+        out.append(af_from_xref)
+    else:
+        af = _alphafold_summary(uniprot_id)
+        if af:
+            out.append(af)
+    # AlphaFill — only meaningful if AF exists (it's an AF-derived model).
+    # We probe its status endpoint quietly; if the user has no AF model
+    # there's no AlphaFill either, so skip the call.
+    if af_from_xref is not None or any(e["pdb_id"].startswith("AF:") for e in out):
+        afill = _alphafill_summary(uniprot_id)
+        if afill:
+            out.append(afill)
 
     log("phi", f"UniProt {uniprot_id}: found {len(out)} structural entries (incl. models)")
     return out
@@ -134,23 +161,91 @@ def _swissmodel_summary(uniprot_id: str, timeout: float = 6.0) -> Optional[dict]
 
 
 def _alphafold_summary(uniprot_id: str, timeout: float = 6.0) -> Optional[dict]:
-    """Probe AlphaFold DB and return a list-entry dict if a prediction exists."""
+    """Probe AlphaFold DB and return a list-entry dict if a prediction exists.
+
+    Tries multiple model versions (v5 → v2) because AlphaFold DB bumps the
+    version periodically and old probes silently start returning 404. Falls
+    back to a small ranged GET when HEAD returns non-200, since the EBI
+    CDN occasionally rejects HEAD on otherwise-fetchable static files.
+    """
     try:
         import httpx
     except ImportError:
         return None
-    url = f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_v4.pdb"
+    headers = {"User-Agent": "PhiEx/0.1"}
     try:
         with httpx.Client(timeout=timeout, follow_redirects=True) as c:
-            r = c.head(url, headers={"User-Agent": "PhiEx/0.1"})
-            if r.status_code == 200:
-                return {
-                    "pdb_id":     f"AF:{uniprot_id}",
-                    "method":     "AlphaFold (predicted)",
-                    "resolution": None,
-                    "chains":     "",
-                }
+            for v in ("v5", "v4", "v3", "v2"):
+                url = f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_{v}.pdb"
+                # HEAD first (cheap)
+                try:
+                    r = c.head(url, headers=headers)
+                    if r.status_code == 200:
+                        return {
+                            "pdb_id":     f"AF:{uniprot_id}",
+                            "method":     f"AlphaFold (predicted, {v})",
+                            "resolution": None,
+                            "chains":     "",
+                        }
+                except Exception:
+                    pass
+                # GET fallback — only ask for the first 1KB so we don't pull the whole PDB
+                try:
+                    r = c.get(url, headers={**headers, "Range": "bytes=0-1023"})
+                    if r.status_code in (200, 206):
+                        return {
+                            "pdb_id":     f"AF:{uniprot_id}",
+                            "method":     f"AlphaFold (predicted, {v})",
+                            "resolution": None,
+                            "chains":     "",
+                        }
+                except Exception:
+                    pass
     except Exception:
+        pass
+    return None
+
+
+# Valid leading tokens for any well-formed PDB file. We use this both to
+# accept newly-downloaded responses and to validate cache reads — earlier
+# versions wrote ANY non-empty response (HTML errors, redirect pages) to
+# the cache, then returned the same garbage forever on subsequent loads.
+_PDB_VALID_HEADS = ("HEADER", "ATOM", "HETATM", "REMARK",
+                    "TITLE", "COMPND", "CRYST", "MODEL")
+
+
+def _is_valid_pdb_text(s: Optional[str], min_atoms: int = 1) -> bool:
+    """True if `s` looks like a real PDB file with at least one ATOM record."""
+    if not s or len(s) < 80:
+        return False
+    if not s.lstrip().startswith(_PDB_VALID_HEADS):
+        return False
+    # Quick sanity: count ATOM/HETATM lines without scanning the whole file
+    atoms = 0
+    for line in s.splitlines():
+        if line.startswith(("ATOM ", "HETATM")):
+            atoms += 1
+            if atoms >= min_atoms:
+                return True
+    return atoms >= min_atoms
+
+
+def _read_cache_or_purge(path: Path, label: str) -> Optional[str]:
+    """Return cached PDB text iff valid; otherwise delete the cache and return None.
+
+    Stops a single bad fetch from poisoning every subsequent load — which
+    is the actual reason AlphaFold has been silently failing for users.
+    """
+    if not path.exists():
+        return None
+    text = path.read_text()
+    if _is_valid_pdb_text(text):
+        log("phi", f"{label}: loaded from cache")
+        return text
+    log("sys", f"{label}: cached file at {path} is malformed ({len(text)} bytes) — purging")
+    try:
+        path.unlink()
+    except OSError:
         pass
     return None
 
@@ -160,9 +255,10 @@ def fetch_pdb_text(pdb_id: str, cache_dir: str | os.PathLike = "data/pdb") -> Op
     so re-runs are fast and the test target works offline after first run.
 
     Special prefixes route to alternative structure sources:
-        SWISS:<UniProt>  → SWISS-MODEL homology model for that accession
-        AF:<UniProt>     → AlphaFold DB prediction for that accession
-        AF2:<UniProt>    → alias for AF:
+        SWISS:<UniProt>   → SWISS-MODEL homology model
+        AF:<UniProt>      → AlphaFold DB prediction (PDB, with CIF fallback)
+        AF2:<UniProt>     → alias for AF:
+        AFILL:<UniProt>   → AlphaFill prediction (cofactor-transplanted AF model)
     Anything else is treated as an RCSB PDB code.
     """
     pdb_id = pdb_id.upper().strip()
@@ -177,16 +273,17 @@ def fetch_pdb_text(pdb_id: str, cache_dir: str | os.PathLike = "data/pdb") -> Op
             return fetch_swissmodel_pdb(acc, cache_dir=cache_dir)
         if prefix in ("AF", "AF2", "ALPHAFOLD"):
             return fetch_alphafold_pdb(acc, cache_dir=cache_dir)
+        if prefix in ("AFILL", "ALPHAFILL"):
+            return fetch_alphafill_pdb(acc, cache_dir=cache_dir)
         log("sys", f"unknown structure prefix '{prefix}' — falling back to RCSB lookup of {acc}")
         pdb_id = acc
-    cached = cache / f"{pdb_id}.pdb"
-    if cached.exists():
-        log("phi", f"PDB {pdb_id}: loaded from cache")
-        return cached.read_text()
+    cached_text = _read_cache_or_purge(cache / f"{pdb_id}.pdb", f"PDB {pdb_id}")
+    if cached_text is not None:
+        return cached_text
     url = f"https://files.rcsb.org/download/{pdb_id}.pdb"
     text = _fetch_text(url)
-    if text:
-        cached.write_text(text)
+    if _is_valid_pdb_text(text):
+        (cache / f"{pdb_id}.pdb").write_text(text)
         log("phi", f"PDB {pdb_id}: fetched ({len(text)} bytes) and cached")
         return text
     return None
@@ -207,12 +304,12 @@ def fetch_swissmodel_pdb(uniprot_id: str,
     cache = Path(cache_dir)
     cache.mkdir(parents=True, exist_ok=True)
     cached = cache / f"SWISS_{uniprot_id}.pdb"
-    if cached.exists():
-        log("phi", f"SWISS-MODEL {uniprot_id}: loaded from cache")
-        return cached.read_text()
+    cached_text = _read_cache_or_purge(cached, f"SWISS-MODEL {uniprot_id}")
+    if cached_text is not None:
+        return cached_text
     url = f"https://swissmodel.expasy.org/repository/uniprot/{uniprot_id}.pdb"
     text = _fetch_text(url)
-    if text and text.lstrip().startswith(("HEADER", "ATOM", "REMARK", "TITLE")):
+    if _is_valid_pdb_text(text):
         cached.write_text(text)
         log("phi", f"SWISS-MODEL {uniprot_id}: fetched ({len(text)} bytes) and cached")
         return text
@@ -224,29 +321,210 @@ def fetch_alphafold_pdb(uniprot_id: str,
                         cache_dir: str | os.PathLike = "data/pdb") -> Optional[str]:
     """Fetch the AlphaFold DB prediction for a UniProt accession.
 
-    AlphaFold DB serves PDBs at predictable URLs:
-        https://alphafold.ebi.ac.uk/files/AF-{ID}-F1-model_v4.pdb
-    For most fungal proteins (and indeed most of UniProt) AlphaFold has a
-    prediction, so this is the most reliable fallback when no PDB and no
-    SWISS-MODEL exist.
+    AlphaFold DB serves models at predictable URLs:
+        https://alphafold.ebi.ac.uk/files/AF-{ID}-F1-model_v{N}.pdb
+        https://alphafold.ebi.ac.uk/files/AF-{ID}-F1-model_v{N}.cif
+    Newer "extended" entries (AFDB Clusters / collaborator predictions)
+    are CIF-only — when every PDB version 404s we fall back to CIF and
+    convert it inline so the rest of the pipeline doesn't have to care.
     """
     uniprot_id = uniprot_id.upper().strip()
     cache = Path(cache_dir)
     cache.mkdir(parents=True, exist_ok=True)
     cached = cache / f"AF_{uniprot_id}.pdb"
-    if cached.exists():
-        log("phi", f"AlphaFold {uniprot_id}: loaded from cache")
-        return cached.read_text()
-    # Try v4 first (current as of late 2023+); fall back to v3, v2.
-    for v in ("v4", "v3", "v2"):
+    cached_text = _read_cache_or_purge(cached, f"AlphaFold {uniprot_id}")
+    if cached_text is not None:
+        return cached_text
+    # Try v5 first (current as of 2024+); fall back to v4, v3, v2.
+    for v in ("v5", "v4", "v3", "v2"):
         url = f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_{v}.pdb"
         text = _fetch_text(url)
-        if text and text.lstrip().startswith(("HEADER", "ATOM", "REMARK", "TITLE")):
+        if _is_valid_pdb_text(text):
             cached.write_text(text)
             log("phi", f"AlphaFold {uniprot_id} ({v}): fetched ({len(text)} bytes) and cached")
             return text
-    log("sys", f"AlphaFold {uniprot_id}: no prediction available")
+    # CIF fallback for extended entries
+    for v in ("v5", "v4", "v3", "v2"):
+        url = f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_{v}.cif"
+        cif = _fetch_text(url)
+        if cif and ("_atom_site." in cif or "loop_" in cif):
+            pdb_text = _cif_to_pdb_text(cif)
+            if _is_valid_pdb_text(pdb_text):
+                cached.write_text(pdb_text)
+                log("phi", f"AlphaFold {uniprot_id} ({v}, CIF→PDB): "
+                           f"fetched ({len(cif)} bytes CIF, {len(pdb_text)} bytes PDB)")
+                return pdb_text
+    log("sys", f"AlphaFold {uniprot_id}: no prediction available (PDB and CIF both failed)")
     return None
+
+
+# ────────────────────────────────────────────────────────────────────────
+# AlphaFill — cofactor-transplanted AlphaFold models
+# ────────────────────────────────────────────────────────────────────────
+
+def fetch_alphafill_pdb(uniprot_id: str,
+                        cache_dir: str | os.PathLike = "data/pdb") -> Optional[str]:
+    """Fetch the AlphaFill prediction for a UniProt accession.
+
+    AlphaFill (https://alphafill.eu) takes an AlphaFold model and
+    transplants ligands/cofactors from homologous PDB entries. The API
+    serves mmCIF only:
+        https://alphafill.eu/v1/aff/{ID}
+    We convert to PDB on the fly so the parser doesn't need a CIF code path.
+    """
+    uniprot_id = uniprot_id.upper().strip()
+    cache = Path(cache_dir)
+    cache.mkdir(parents=True, exist_ok=True)
+    cached = cache / f"AFILL_{uniprot_id}.pdb"
+    cached_text = _read_cache_or_purge(cached, f"AlphaFill {uniprot_id}")
+    if cached_text is not None:
+        return cached_text
+    url = f"https://alphafill.eu/v1/aff/{uniprot_id}"
+    cif = _fetch_text(url, timeout=20.0)
+    if not cif or ("_atom_site." not in cif and "loop_" not in cif):
+        log("sys", f"AlphaFill {uniprot_id}: no model available")
+        return None
+    pdb_text = _cif_to_pdb_text(cif)
+    if not _is_valid_pdb_text(pdb_text):
+        log("sys", f"AlphaFill {uniprot_id}: CIF→PDB conversion produced no atoms")
+        return None
+    cached.write_text(pdb_text)
+    log("phi", f"AlphaFill {uniprot_id}: fetched "
+               f"({len(cif)} bytes CIF, {len(pdb_text)} bytes PDB) and cached")
+    return pdb_text
+
+
+def _alphafill_summary(uniprot_id: str, timeout: float = 6.0) -> Optional[dict]:
+    """Probe AlphaFill and return a list-entry dict if a model exists."""
+    try:
+        import httpx
+    except ImportError:
+        return None
+    headers = {"User-Agent": "PhiEx/0.1"}
+    # AlphaFill exposes a JSON status endpoint that's cheaper than fetching
+    # the full structure — use it for the existence probe.
+    url = f"https://alphafill.eu/v1/aff/{uniprot_id}/status"
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=True) as c:
+            r = c.get(url, headers=headers)
+            if r.status_code == 200:
+                return {
+                    "pdb_id":     f"AFILL:{uniprot_id}",
+                    "method":     "AlphaFill (cofactor-transplanted AF)",
+                    "resolution": None,
+                    "chains":     "",
+                }
+            # Some AlphaFill deployments return the model directly with no status route
+            r = c.head(f"https://alphafill.eu/v1/aff/{uniprot_id}", headers=headers)
+            if r.status_code == 200:
+                return {
+                    "pdb_id":     f"AFILL:{uniprot_id}",
+                    "method":     "AlphaFill (cofactor-transplanted AF)",
+                    "resolution": None,
+                    "chains":     "",
+                }
+    except Exception:
+        pass
+    return None
+
+
+# ────────────────────────────────────────────────────────────────────────
+# minimal mmCIF → PDB converter
+# ────────────────────────────────────────────────────────────────────────
+
+def _cif_to_pdb_text(cif: str) -> str:
+    """Convert an mmCIF file to PDB text by extracting the atom_site loop.
+
+    Handles the standard PDBx/mmCIF atom_site fields; ignores everything
+    else. Coordinates, occupancy, B-factor, chain, residue number, and
+    element are preserved. This is intentionally minimal — we just need
+    enough for the existing PDB parser to work.
+    """
+    lines = cif.splitlines()
+    i = 0
+    n = len(lines)
+    out: list[str] = ["HEADER    CONVERTED FROM mmCIF BY PhiEx"]
+    atom_serial = 1
+    while i < n:
+        line = lines[i].strip()
+        if line == "loop_":
+            # Collect column names for this loop
+            cols: list[str] = []
+            i += 1
+            while i < n and lines[i].lstrip().startswith("_"):
+                cols.append(lines[i].strip())
+                i += 1
+            # Is this the atom_site loop?
+            if not any(c.startswith("_atom_site.") for c in cols):
+                continue
+            col_idx = {c.split(".",1)[1]: k for k, c in enumerate(cols)
+                       if c.startswith("_atom_site.")}
+            # Read data rows until we hit the next loop_/category or '#' / EOF
+            while i < n:
+                row = lines[i]
+                stripped = row.strip()
+                if (not stripped) or stripped.startswith("#") \
+                        or stripped == "loop_" or stripped.startswith("_") \
+                        or stripped.startswith("data_"):
+                    break
+                # mmCIF uses whitespace-separated tokens, with quoted strings
+                # for values containing spaces. The atom_site loop never has
+                # spaces inside its values, so a plain split is safe.
+                toks = stripped.split()
+                if len(toks) < len(col_idx):
+                    i += 1
+                    continue
+                def g(name: str, default: str = ".") -> str:
+                    k = col_idx.get(name)
+                    return toks[k] if k is not None and k < len(toks) else default
+                group = g("group_PDB", "ATOM").upper()
+                if group not in ("ATOM", "HETATM"):
+                    i += 1
+                    continue
+                atom_name = g("auth_atom_id") if "auth_atom_id" in col_idx else g("label_atom_id")
+                atom_name = atom_name.strip('"').strip("'")
+                element   = g("type_symbol", atom_name[:1]).strip(".")
+                resname   = (g("auth_comp_id") if "auth_comp_id" in col_idx
+                             else g("label_comp_id")).strip()
+                chain     = (g("auth_asym_id") if "auth_asym_id" in col_idx
+                             else g("label_asym_id"))[:1] or "A"
+                resseq_s  = g("auth_seq_id") if "auth_seq_id" in col_idx else g("label_seq_id")
+                try:
+                    resseq = int(resseq_s)
+                except (ValueError, TypeError):
+                    i += 1
+                    continue
+                try:
+                    x = float(g("Cartn_x")); y = float(g("Cartn_y")); z = float(g("Cartn_z"))
+                except ValueError:
+                    i += 1
+                    continue
+                try:
+                    occ = float(g("occupancy", "1.00"))
+                except ValueError:
+                    occ = 1.0
+                try:
+                    bfac = float(g("B_iso_or_equiv", "0.00"))
+                except ValueError:
+                    bfac = 0.0
+                # Format atom name to PDB convention (4-char field, element-aligned)
+                if len(element) == 1 and len(atom_name) < 4:
+                    aname = f" {atom_name:<3}"
+                else:
+                    aname = f"{atom_name:<4}"
+                rec = "ATOM  " if group == "ATOM" else "HETATM"
+                out.append(
+                    f"{rec}{atom_serial:5d} {aname[:4]} {resname[:3]:>3} "
+                    f"{chain}{resseq:4d}    "
+                    f"{x:8.3f}{y:8.3f}{z:8.3f}{occ:6.2f}{bfac:6.2f}          "
+                    f"{element[:2]:>2}"
+                )
+                atom_serial += 1
+                i += 1
+            continue
+        i += 1
+    out.append("END")
+    return "\n".join(out) + "\n"
 
 
 def fetch_uniprot_annotations(accession: str,
@@ -475,12 +753,28 @@ def fetch_protein(pdb_id: str = APX_DEFAULT_PDB,
     Returns (protein, cofactors, annotations).  Caller is responsible for
     forming a ComplexState and routing further pipeline stages.
     """
+    # Surface the fetch attempt so the UI ticker shows progress for slow
+    # AlphaFold / SWISS-MODEL pulls — otherwise the viewers just stay blank
+    # for several seconds with no indication anything is happening.
+    if pdb_id.upper().startswith(("AF:", "AF2:", "ALPHAFOLD:")):
+        log("phi", f"AlphaFold {pdb_id}: fetching from EBI…")
+    elif pdb_id.upper().startswith("SWISS:"):
+        log("phi", f"SWISS-MODEL {pdb_id}: fetching from ExPASy…")
     pdb_text = fetch_pdb_text(pdb_id)
     annotations = fetch_uniprot_annotations(uniprot)
     if pdb_text is None:
-        log("sys", f"PDB fetch unavailable, using STUB sequence-only APX")
-        protein = stub_apx_protein()
-        return protein, [], annotations
+        # Only fall back to the APX stub when the user is actually asking
+        # for APX. For any other target, returning the APX sequence would
+        # silently swap in a completely unrelated protein (an Aspergillus
+        # niger glucose oxidase request would come back as pea ascorbate
+        # peroxidase). Instead, return an empty Protein so the UI surfaces
+        # a clear "structure unavailable" state.
+        if uniprot.upper() == APX_DEFAULT_UNIPROT or pdb_id.upper() == APX_DEFAULT_PDB:
+            log("sys", f"PDB fetch unavailable, using STUB sequence-only APX")
+            return stub_apx_protein(), [], annotations
+        log("sys", f"PDB {pdb_id} (UniProt {uniprot}): fetch failed — "
+                   f"check network / verify the AlphaFold model exists for this accession")
+        return Protein(name=pdb_id, sequence="", source="unavailable"), [], annotations
     protein, cofactors = parse_pdb_text(pdb_text, name=pdb_id)
     log("phi", f"parsed {pdb_id}: {protein.n_residues} residues, "
                 f"{len(cofactors)} cofactor(s) "

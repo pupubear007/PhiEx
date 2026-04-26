@@ -386,8 +386,8 @@ $("#find-pdb").addEventListener("click", async () => {
     const rows = r.entries.slice(0, 10).map(e => {
       const res = e.resolution != null ? e.resolution.toFixed(2) + " Å" : "—";
       const isBest = e === r.entries[0] ? '<b style="color:var(--accent)">★ </b>' : "";
-      const isModel = /SWISS|AlphaFold|Modeling|Predicted/i.test(e.method || "")
-                      || /^(SWISS|AF):/.test(e.pdb_id || "");
+      const isModel = /SWISS|AlphaFold|AlphaFill|Modeling|Predicted/i.test(e.method || "")
+                      || /^(SWISS|AF|AFILL|ALPHAFILL):/i.test(e.pdb_id || "");
       const idColor = isModel ? "var(--stub)" : "var(--ink)";
       return `<div style="cursor:pointer;padding:2px 0" data-pdb="${e.pdb_id}">
         ${isBest}<b style="color:${idColor}">${e.pdb_id}</b>
@@ -395,12 +395,21 @@ $("#find-pdb").addEventListener("click", async () => {
       </div>`;
     }).join("");
     out.innerHTML = `<div style="margin-bottom:4px;color:var(--phi)">${r.n} PDB entries — click to pick</div>${rows}`;
-    // Click-to-pick on the alternates
+    // Click-to-pick on the alternates. For predicted-model entries
+    // (AF: / SWISS:) we also auto-trigger the STRUCTURE stage, since
+    // those rows have no resolution / chain metadata to inspect — the
+    // user almost certainly clicked them to render the model, not to
+    // stage a different fetch. For experimental PDBs we leave the
+    // explicit STRUCTURE button click in place (cheaper to be deliberate).
     out.querySelectorAll("[data-pdb]").forEach(el => {
       el.addEventListener("click", () => {
-        $("#i-pdb").value = el.getAttribute("data-pdb");
+        const pid = el.getAttribute("data-pdb");
+        $("#i-pdb").value = pid;
         out.querySelectorAll("[data-pdb]").forEach(x =>
           x.style.background = x === el ? "var(--rule)" : "");
+        if (/^(AF|AF2|ALPHAFOLD|SWISS|AFILL|ALPHAFILL):/i.test(pid)) {
+          $("#run-structure").click();
+        }
       });
     });
   } catch (e) {
