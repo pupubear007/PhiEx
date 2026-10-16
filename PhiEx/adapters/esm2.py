@@ -78,7 +78,25 @@ class ESM2Adapter(LearnedModelBase):
     def predict(self, sequence: str, name: str = "target") -> Prediction:
         if self.is_stub or self._model is None:
             return self._predict_stub(sequence, name)
-        return self._predict_real(sequence, name)
+        try:
+            return self._predict_real(sequence, name)
+        except Exception as e:
+            # Typical on Apple Silicon: an MPS op or memory limit (the
+            # last-layer attention for a ~1000-residue input is ~1 GB).
+            # Retry on CPU before giving up on the real model.
+            log("sys", f"ESM-2 forward on {self.device} failed "
+                       f"({type(e).__name__}: {e})")
+            if self.device != "cpu":
+                try:
+                    self._model = self._model.to("cpu")
+                    self.device = "cpu"
+                    self.backend = f"fair-esm {self.variant} on cpu (fallback)"
+                    log("sys", "ESM-2 retrying on cpu")
+                    return self._predict_real(sequence, name)
+                except Exception as e2:
+                    log("sys", f"ESM-2 on cpu failed too ({type(e2).__name__}: {e2})")
+            log("sys", "ESM-2 falling back to stub for this prediction")
+            return self._predict_stub(sequence, name)
 
     def _predict_real(self, sequence: str, name: str) -> Prediction:
         import torch

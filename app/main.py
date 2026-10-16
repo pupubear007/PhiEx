@@ -81,6 +81,22 @@ async def _startup() -> None:
 
 
 # ────────────────────────────────────────────────────────────────────────
+# errors — surface the cause instead of a bare "HTTP 500"
+# ────────────────────────────────────────────────────────────────────────
+
+@app.exception_handler(Exception)
+async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
+    """Log the failure to the ticker and the server console, and return it
+    as {"error": ...} — the frontend's postJSON shows that field verbatim."""
+    import traceback
+    where = request.url.path
+    msg = f"{type(exc).__name__}: {exc}"
+    log("sys", f"{where} failed — {msg}")
+    traceback.print_exception(exc)
+    return JSONResponse({"error": f"{where}: {msg}"}, status_code=500)
+
+
+# ────────────────────────────────────────────────────────────────────────
 # static
 # ────────────────────────────────────────────────────────────────────────
 

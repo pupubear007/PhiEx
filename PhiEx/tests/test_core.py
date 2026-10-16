@@ -270,3 +270,54 @@ def test_analysis_unavailable_when_frames_miss_ligand():
     assert rmsf_per_residue(traj) == {}
     fe = state.cofactors[0].metal_atom.xyz
     assert residence_time(traj, fe) is None
+
+
+# ────────────────────────────────────────────────────────────────────────
+# ESM-2: a failing forward pass on the accelerator falls back, not 500s
+# ────────────────────────────────────────────────────────────────────────
+
+def test_esm2_falls_back_to_cpu_then_stub(monkeypatch):
+    from PhiEx.adapters.esm2 import ESM2Adapter
+
+    class _FakeModel:
+        def to(self, device):
+            self.device = device
+            return self
+
+    esm2 = ESM2Adapter(device="cpu")
+    esm2.is_stub, esm2._model, esm2.device = False, _FakeModel(), "mps"
+    calls = []
+
+    def flaky(sequence, name):
+        calls.append(esm2.device)
+        if esm2.device == "mps":
+            raise RuntimeError("MPS backend out of memory")
+        return Prediction(value={"embedding": [], "attention": []}, uncertainty=0.1)
+
+    monkeypatch.setattr(esm2, "_predict_real", flaky)
+    assert esm2.predict("ACDE").uncertainty == 0.1
+    assert calls == ["mps", "cpu"] and esm2.device == "cpu"
+
+    monkeypatch.setattr(esm2, "_predict_real",
+                        lambda s, n: (_ for _ in ()).throw(RuntimeError("boom")))
+    pred = esm2.predict("ACDE")               # cpu fails too → stub
+    assert pred.meta.get("stub") is True
+
+
+def test_api_errors_are_reported_not_bare_500(monkeypatch):
+    from fastapi.testclient import TestClient
+    import app.main as main
+
+    class _Broken:
+        def __init__(self, *a, **k):
+            raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr(main, "ESM2Adapter", _Broken)
+    main.SESSION["protein"] = Protein(name="t", sequence="ACDE")
+    try:
+        with TestClient(main.app, raise_server_exceptions=False) as c:
+            r = c.post("/api/annotate", json={})
+    finally:
+        main.SESSION.pop("protein", None)
+    assert r.status_code == 500
+    assert "simulated failure" in r.json()["error"]
