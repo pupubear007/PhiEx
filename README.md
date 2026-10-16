@@ -106,15 +106,19 @@ What happens, in framework terms:
 6. **s∃ ⟳ tϕ active learning over a mutation panel.** Generate ~10–20
    single-point mutations of active-site residues. Seed the surrogate
    with five cheap evaluations. Then three iterations of "rank by UCB →
-   evaluate the top → refit". The UI's heatmap fills in. The loop
-   converges on a small set of residues whose mutations produced the
-   largest observed Δ.
+   evaluate the top → refit". The objective is effect magnitude |Δ|, for
+   both acquisition and the final ranking. The UI's heatmap fills in. The
+   loop converges on a small set of residues whose mutations produced the
+   largest observed |Δ|. Surrogate quality is reported out-of-sample:
+   prospective RMSE, leave-one-out R², and ±1σ coverage.
 
-7. **Cross-check.** Compare those residues against the residues
-   highlighted by ESM-2's last-layer attention (column-wise mean
-   importance — a documented heuristic). Where they agree, confidence
-   ↑; where they disagree, the residue is flagged in red as a discovery
-   candidate.
+7. **Cross-check.** Compare those residues (plus residues in contact
+   with the ligand) against the residues highlighted by ESM-2's
+   last-layer attention (column-wise mean importance — a documented
+   heuristic). Where they agree, confidence ↑. A residue the trajectory
+   flags but attention does not is marked in red as a discovery
+   candidate; attention-only residues are listed but not flagged. The
+   cross-check is skipped when ESM-2 runs as a stub.
 
 ## Architecture
 
@@ -206,9 +210,26 @@ do not bake them in elsewhere.
   `adapters/diffdock.py` has the exact signature the real model will
   fill. The stub generates plausible poses with a confidence head so
   the rest of the pipeline can run.
-* **Foldseek** is a stub for the APX example (canned plant-peroxidase
-  hits). Replace `_predict_real` with a real `foldseek easy-search`
-  call once the database is local.
+* **Foldseek** runs for real when `foldseek` is on PATH and a database
+  exists at `models/foldseek/pdb` (`make weights` downloads the PDB
+  database) or `$PHIEX_FOLDSEEK_DB`. It searches chain A only, drops the
+  query's own entry, and maps hits to GO terms via the PDBe SIFTS API
+  (cached in `models/foldseek/go_cache.json`). Otherwise it uses canned
+  APX neighbours.
+* **ESMFold** loads fair-esm if `openfold` is installed, otherwise the
+  Hugging Face `facebook/esmfold_v1` port (no openfold). It needs ≥ 32 GB
+  RAM (ESM-2 3B inside); below that it stays a stub unless
+  `PHIEX_ESMFOLD=force`. `PHIEX_ESMFOLD=off` disables it. Only one chain
+  is folded (`PHIEX_ESMFOLD_CHAIN`, default first chain), and Cα RMSD
+  is computed after Kabsch superposition.
+* **MACE-OFF23** runs on CPU by default (`PHIEX_MACE_DEVICE` to change):
+  the checkpoint is float64, which MPS cannot hold during loading.
+* **Trajectory analysis requires a matching atom layout.** Contacts,
+  RMSF and residence index frame positions in the order protein →
+  cofactors → ligands. The real OpenMM path builds its system from the
+  raw PDB text, so its atoms usually don't line up (waters in, docked
+  ligand out); analysis then reports "unavailable" rather than
+  mis-indexing.
 * **OpenMM heme parametrization** is the gap that most often forces the
   stub MD path on real hardware. Production heme parametrization
   requires GAFF or a custom XML; v0 falls back to a synthetic harmonic
@@ -226,8 +247,9 @@ do not bake them in elsewhere.
 * **ESM-2 attention probing** is a column-wise mean of the last-layer,
   mean-over-heads attention. Real attention probing per-head is
   post-v0.
-* **AL evaluator** in v0 is a cheap proxy: a MACE-region energy delta
-  perturbed by a BLOSUM-driven scalar. The interface
+* **AL evaluator** in v0 is a cheap proxy: a BLOSUM-driven |Δ| per
+  mutation, with the MACE-region ensemble σ as observation noise. The
+  structure is not mutated, so AL results reflect the proxy, not physics. The interface
   (`evaluator: dict -> (y, sigma)`) is the correct shape; production
   swaps in a real residence-time MD evaluator.
 

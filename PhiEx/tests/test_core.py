@@ -207,3 +207,221 @@ def test_mace_forces_match_region_size():
     forces = mace.forces(state)
     assert len(forces) == 5
     assert mace.predict(state).uncertainty is not None
+
+
+# ────────────────────────────────────────────────────────────────────────
+# surrogate quality is reported out-of-sample
+# ────────────────────────────────────────────────────────────────────────
+
+def test_al_history_reports_prospective_and_loo_metrics():
+    seq = "ACDEFGHIKLMNPQRSTVWY" * 3
+    panel = generate_mutation_panel(list(range(1, 12)), seq, ["A", "K"])
+    loop = ActiveLearningLoop(surrogate=GBRSurrogate(sequence_length=len(seq)),
+                              evaluator=synthetic_evaluator)
+    loop.seed(panel[:4])
+    loop.set_candidates(panel[4:])
+    results = [loop.iterate() for _ in range(3)]
+    last = results[-1].to_json()
+    errs = [r.observed - r.predicted for r in results]
+    assert last["prospective_rmse"] == pytest.approx(
+        (sum(e * e for e in errs) / len(errs)) ** 0.5)
+    assert 0.0 <= last["coverage_1sigma"] <= 1.0
+    assert last["loo_r2"] is not None
+    # the in-sample fit is optimistic; LOO must not be better than it
+    assert last["loo_r2"] <= last["train_r2"] + 1e-9
+
+
+# ────────────────────────────────────────────────────────────────────────
+# shared working-structure fallback
+# ────────────────────────────────────────────────────────────────────────
+
+def test_resolve_working_structure_adopts_prediction_and_stub_heme():
+    from PhiEx.pipeline import resolve_working_structure
+    predicted = _toy_complex().protein
+    seq_only = Protein(name="exp", sequence=predicted.sequence)
+    protein, cofactors = resolve_working_structure(seq_only, [], predicted)
+    assert protein is predicted
+    assert len(cofactors) == 1 and cofactors[0].metadata.get("stub")
+
+
+def test_resolve_working_structure_keeps_experimental():
+    state = _toy_complex()
+    from PhiEx.pipeline import resolve_working_structure
+    protein, cofactors = resolve_working_structure(
+        state.protein, list(state.cofactors), predicted=None)
+    assert protein is state.protein
+    assert cofactors == list(state.cofactors)
+
+
+# ────────────────────────────────────────────────────────────────────────
+# analysis refuses frames whose atom layout doesn't match the state
+# ────────────────────────────────────────────────────────────────────────
+
+def test_analysis_unavailable_when_frames_miss_ligand():
+    from PhiEx.core.trajectory import Trajectory, Frame
+    from PhiEx.analysis import rmsf_per_residue, frames_match_topology
+    state = _toy_complex()
+    protein_only = tuple(a.xyz for a in state.protein.all_atoms())
+    traj = Trajectory(parent_state=state,
+                      frames=[Frame(step=i, time_ps=0.1 * i, positions=protein_only)
+                              for i in (1, 2)])
+    assert not frames_match_topology(traj)
+    assert ligand_residue_contacts(traj) == {}
+    assert rmsf_per_residue(traj) == {}
+    fe = state.cofactors[0].metal_atom.xyz
+    assert residence_time(traj, fe) is None
+
+
+# ────────────────────────────────────────────────────────────────────────
+# ESM-2: a failing forward pass on the accelerator falls back, not 500s
+# ────────────────────────────────────────────────────────────────────────
+
+def test_esm2_falls_back_to_cpu_then_stub(monkeypatch):
+    from PhiEx.adapters.esm2 import ESM2Adapter
+
+    class _FakeModel:
+        def to(self, device):
+            self.device = device
+            return self
+
+    esm2 = ESM2Adapter(device="cpu")
+    esm2.is_stub, esm2._model, esm2.device = False, _FakeModel(), "mps"
+    calls = []
+
+    def flaky(sequence, name):
+        calls.append(esm2.device)
+        if esm2.device == "mps":
+            raise RuntimeError("MPS backend out of memory")
+        return Prediction(value={"embedding": [], "attention": []}, uncertainty=0.1)
+
+    monkeypatch.setattr(esm2, "_predict_real", flaky)
+    assert esm2.predict("ACDE").uncertainty == 0.1
+    assert calls == ["mps", "cpu"] and esm2.device == "cpu"
+
+    monkeypatch.setattr(esm2, "_predict_real",
+                        lambda s, n: (_ for _ in ()).throw(RuntimeError("boom")))
+    pred = esm2.predict("ACDE")               # cpu fails too → stub
+    assert pred.meta.get("stub") is True
+
+
+def test_api_errors_are_reported_not_bare_500(monkeypatch):
+    from fastapi.testclient import TestClient
+    import app.main as main
+
+    class _Broken:
+        def __init__(self, *a, **k):
+            raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr(main, "ESM2Adapter", _Broken)
+    main.SESSION["protein"] = Protein(name="t", sequence="ACDE")
+    try:
+        with TestClient(main.app, raise_server_exceptions=False) as c:
+            r = c.post("/api/annotate", json={})
+    finally:
+        main.SESSION.pop("protein", None)
+    assert r.status_code == 500
+    assert "simulated failure" in r.json()["error"]
+
+
+# ────────────────────────────────────────────────────────────────────────
+# ESMFold helpers: single-chain folding and superposed RMSD
+# ────────────────────────────────────────────────────────────────────────
+
+def _ca_res(i, chain, xyz, name="ALA"):
+    return Residue(index=i, name=name, chain=chain,
+                   atoms=(Atom(i, "CA", "C", xyz),))
+
+
+def test_select_chain_sequence_picks_one_chain():
+    from PhiEx.adapters.esmfold import select_chain_sequence
+    res = tuple([_ca_res(1, "A", (0, 0, 0), "HIS"), _ca_res(2, "A", (1, 0, 0), "ARG"),
+                 _ca_res(1, "B", (0, 5, 0), "TRP")])
+    p = Protein(name="x", sequence="HRW", residues=res)
+    assert select_chain_sequence(p) == ("A", "HR")
+    assert select_chain_sequence(p, "B") == ("B", "W")
+    assert select_chain_sequence(Protein(name="s", sequence="ACD")) == (None, "ACD")
+
+
+def test_ca_rmsd_is_superposition_invariant():
+    import math as _m
+    from PhiEx.adapters.esmfold import ca_rmsd
+    pts = [(0, 0, 0), (3.8, 0, 0), (3.8, 3.8, 0), (0, 3.8, 1.0), (1.0, 1.0, 4.0)]
+    exp = Protein(name="e", residues=tuple(_ca_res(10 + i, "A", p) for i, p in enumerate(pts)))
+    # rotate 90° about z and translate; renumber as ESMFold would (chain A, 1..N)
+    rot = [(-y + 7, x - 3, z + 2) for x, y, z in pts]
+    pred = Protein(name="p", residues=tuple(_ca_res(1 + i, "A", p) for i, p in enumerate(rot)),
+                   metadata={"query_chain": "A"})
+    assert ca_rmsd(pred, exp) < 1e-6
+
+
+def test_esmfold_off_switch_keeps_stub(monkeypatch):
+    from PhiEx.adapters.esmfold import ESMFoldAdapter
+    monkeypatch.setenv("PHIEX_ESMFOLD", "off")
+    a = ESMFoldAdapter(device="cpu")
+    assert a.is_stub and "PHIEX_ESMFOLD=off" in a.backend
+
+
+def test_foldseek_target_parsing_and_single_chain():
+    from PhiEx.adapters.foldseek import _pdb_id_from_target, _single_chain_pdb
+    assert _pdb_id_from_target("1oag-assembly1.cif.gz_A") == "1oag"
+    assert _pdb_id_from_target("2CCA_B") == "2cca"
+    assert _pdb_id_from_target("AF-Q9XXX-F1-model_v4") is None
+    pdb = ("ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 0.00           C\n"
+           "ATOM      2  CA  ALA B   1       1.000   0.000   0.000  1.00 0.00           C\n")
+    text, chain = _single_chain_pdb(Protein(name="t", pdb_text=pdb))
+    assert chain == "A" and text.count("ATOM") == 1
+
+
+def test_mace_defaults_to_cpu(monkeypatch):
+    monkeypatch.delenv("PHIEX_MACE_DEVICE", raising=False)
+    assert MACEAdapter().device == "cpu"
+
+
+# ────────────────────────────────────────────────────────────────────────
+# AlphaFold fetch: API first, no version guessing
+# ────────────────────────────────────────────────────────────────────────
+
+class _FakeResp:
+    def __init__(self, code, payload=None, text=""):
+        self.status_code, self._p, self.text = code, payload, text
+    def json(self):
+        return self._p
+
+
+class _FakeClient:
+    routes: dict = {}
+    def __init__(self, *a, **k): pass
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def get(self, url, headers=None):
+        for key, resp in self.routes.items():
+            if key in url:
+                return resp
+        return _FakeResp(404)
+    head = get
+
+
+def test_alphafold_uses_api_url(monkeypatch, tmp_path):
+    import httpx
+    from PhiEx.adapters import pdb as pdbmod
+    pdb_line = "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 90.00           C\nEND\n"
+    _FakeClient.routes = {
+        "/api/prediction/Q00001": _FakeResp(200, [{
+            "entryId": "AF-Q00001-F1", "uniprotAccession": "Q00001", "latestVersion": 9,
+            "pdbUrl": "https://alphafold.ebi.ac.uk/files/AF-Q00001-F1-model_v9.pdb"}]),
+        "model_v9.pdb": _FakeResp(200, text=pdb_line),
+    }
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    text = pdbmod.fetch_alphafold_pdb("Q00001", cache_dir=tmp_path)
+    assert text and text.startswith("ATOM")
+
+
+def test_alphafold_absent_stops_without_guessing(monkeypatch, tmp_path):
+    import httpx
+    from PhiEx.adapters import pdb as pdbmod
+    _FakeClient.routes = {"/api/prediction/": _FakeResp(404)}
+    calls = []
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    monkeypatch.setattr(pdbmod, "_fetch_text", lambda u, **k: calls.append(u))
+    assert pdbmod.fetch_alphafold_pdb("Q00002", cache_dir=tmp_path) is None
+    assert calls == []          # no model_vN probing once the API says "absent"

@@ -26,6 +26,7 @@ Region selection:
 
 from __future__ import annotations
 import math
+import os
 import random
 from dataclasses import dataclass, field
 from typing import Optional
@@ -104,8 +105,14 @@ class MACEAdapter(LearnedModelBase):
     _calc: object = None
 
     def __post_init__(self) -> None:
+        # MACE runs on CPU by default.  The MACE-OFF23 checkpoint is stored
+        # in float64 and mace_off() moves it to the device *before* casting
+        # to float32 — MPS has no float64, so loading on "mps" fails with
+        # "Cannot convert a MPS Tensor to float64 dtype".  The region is
+        # ≤ 50 atoms, so CPU costs nothing noticeable.  Override with
+        # PHIEX_MACE_DEVICE (e.g. "cuda" on a GPU node).
         if not self.device:
-            self.device = select_device()
+            self.device = os.environ.get("PHIEX_MACE_DEVICE", "cpu")
         self._maybe_load()
 
     def _maybe_load(self) -> None:

@@ -14,6 +14,7 @@ the Slurm-ready BatchRunner can pass them through stdin/stdout.
 from .contacts import ligand_residue_contacts, contact_frequency
 from .rmsf import rmsf_per_residue
 from .residence import residence_time
+from .topology import frames_match_topology
 
 __all__ = ["ligand_residue_contacts", "contact_frequency",
-           "rmsf_per_residue", "residence_time"]
+           "rmsf_per_residue", "residence_time", "frames_match_topology"]

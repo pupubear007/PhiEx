@@ -162,6 +162,16 @@ class OpenMMSimulator:
                               positions=tuple(positions)))
             log("phi", f"OpenMM step {step_block+report_every}/{n_steps}  "
                        f"E={energy:.2f} eV  t={t_ps:.2f} ps")
+        n_sys, n_state = pdb.topology.getNumAtoms(), state.n_atoms()
+        if n_sys != n_state:
+            # The system is built from the raw PDB text, so its atoms need
+            # not line up with the ComplexState (waters/hetero atoms in, the
+            # docked ligand out).  Analysis checks this and refuses to
+            # mis-index; flag it here so the cause is visible in the ticker.
+            traj.metadata["topology_mismatch"] = {"system_atoms": n_sys,
+                                                  "state_atoms": n_state}
+            log("sys", f"OpenMM system has {n_sys} atoms but the complex has "
+                       f"{n_state}; trajectory analysis will be unavailable")
         return traj
 
     # ──────────────────────────────────────────────────────────────

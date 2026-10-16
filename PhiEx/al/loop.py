@@ -34,9 +34,26 @@ class ALIterationResult:
     predicted_sd: float
     observed: float
     observed_sd: float
-    surrogate_rmse: Optional[float]
-    surrogate_r2: Optional[float]
+    surrogate_rmse: Optional[float]          # in-sample fit — optimistic
+    surrogate_r2: Optional[float]            # in-sample fit — optimistic
+    loo_r2: Optional[float] = None           # leave-one-out R²
+    # Prospective metrics over every iteration so far: each prediction was
+    # made *before* its observation, so these are honest out-of-sample
+    # scores of the surrogate as the loop actually used it.
+    prospective_rmse: Optional[float] = None
+    coverage_1sigma: Optional[float] = None  # fraction with |obs−pred| ≤ σ_pred
     converged_residues: list[int] = field(default_factory=list)
+
+    def to_json(self) -> dict:
+        return {
+            "iteration": self.iteration, "chosen": self.chosen,
+            "predicted": self.predicted, "predicted_sd": self.predicted_sd,
+            "observed": self.observed, "observed_sd": self.observed_sd,
+            "train_rmse": self.surrogate_rmse, "train_r2": self.surrogate_r2,
+            "loo_r2": self.loo_r2,
+            "prospective_rmse": self.prospective_rmse,
+            "coverage_1sigma": self.coverage_1sigma,
+        }
 
 
 @dataclass
@@ -100,9 +117,6 @@ class ActiveLearningLoop:
         # 3) refit on everything observed so far (seed batch + iterations)
         self._X.append(self._encode(chosen)); self._y.append(observed)
         report = self.surrogate.fit(list(self._X), list(self._y))
-        log("t", f"tϕ refit: n={report.n_samples}  "
-                  f"RMSE={report.rmse}  R²={report.r2}")
-
         # 4) record + return
         result = ALIterationResult(
             iteration=self.iteration, chosen=chosen,
@@ -110,8 +124,17 @@ class ActiveLearningLoop:
             predicted_sd=float(predicted.uncertainty or 0.0),
             observed=observed, observed_sd=observed_sd,
             surrogate_rmse=report.rmse, surrogate_r2=report.r2,
+            loo_r2=getattr(report, "loo_r2", None),
         )
         self.history.append(result)
+        errs = [h.observed - h.predicted for h in self.history]
+        result.prospective_rmse = (sum(e * e for e in errs) / len(errs)) ** 0.5
+        result.coverage_1sigma = sum(
+            abs(h.observed - h.predicted) <= h.predicted_sd for h in self.history
+        ) / len(self.history)
+        log("t", f"tϕ prospective: RMSE={result.prospective_rmse:.3f}  "
+                  f"±1σ coverage={100 * result.coverage_1sigma:.0f}% "
+                  f"over {len(self.history)} predictions")
         return result
 
     # ──────────────────────────────────────────────────────────────

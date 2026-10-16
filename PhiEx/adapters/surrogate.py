@@ -168,9 +168,34 @@ class GBRSurrogate(LearnedModelBase):
         pred = self._q50.predict(X)
         rmse = mean_squared_error(y, pred) ** 0.5
         r2 = r2_score(y, pred)
+        loo_rmse, loo_r2 = self._loo_metrics(X, y, params)
         self._trained = True
-        log("t", f"surrogate tϕ refit: n={n}  RMSE={rmse:.3f}  R²={r2:.3f}")
-        return FitReport(n_samples=n, rmse=rmse, r2=r2)
+        log("t", f"surrogate tϕ refit: n={n}  train RMSE={rmse:.3f}  "
+                  f"LOO R²={'—' if loo_r2 is None else f'{loo_r2:.3f}'}")
+        return FitReport(n_samples=n, rmse=rmse, r2=r2,
+                         loo_rmse=loo_rmse, loo_r2=loo_r2)
+
+    # Leave-one-out is affordable at AL panel sizes and, unlike the
+    # in-sample fit (which a 120-tree GBR drives to R² ≈ 1), says how well
+    # the surrogate generalises.  Skipped above this size to bound cost.
+    _LOO_MAX_N = 60
+
+    def _loo_metrics(self, X, y, params) -> "tuple[Optional[float], Optional[float]]":
+        X = list(X); y = list(y)
+        n = len(X)
+        if n < 4 or n > self._LOO_MAX_N:
+            return None, None
+        from sklearn.ensemble import GradientBoostingRegressor
+        from sklearn.metrics import mean_squared_error, r2_score
+        preds = []
+        for i in range(n):
+            X_tr = X[:i] + X[i+1:]; y_tr = y[:i] + y[i+1:]
+            m = GradientBoostingRegressor(loss="squared_error", **params).fit(X_tr, y_tr)
+            preds.append(float(m.predict([X[i]])[0]))
+        loo_rmse = mean_squared_error(y, preds) ** 0.5
+        # r2 is undefined (sklearn warns, returns nan) when y is constant
+        loo_r2 = r2_score(y, preds) if len(set(y)) > 1 else None
+        return loo_rmse, loo_r2
 
     def _fit_stub(self, X, y):
         self._x_buffer = list(X); self._y_buffer = list(y)
@@ -211,8 +236,10 @@ class GBRSurrogate(LearnedModelBase):
 @dataclass
 class FitReport:
     n_samples: int
-    rmse: Optional[float]
-    r2: Optional[float]
+    rmse: Optional[float]               # in-sample (training) fit
+    r2: Optional[float]                 # in-sample (training) fit
+    loo_rmse: Optional[float] = None    # leave-one-out, i.e. generalisation
+    loo_r2: Optional[float] = None
     deferred: bool = False
     stub: bool = False
 

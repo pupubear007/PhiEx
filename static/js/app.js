@@ -361,7 +361,7 @@ $("#run-al").addEventListener("click", async () => {
       `tϕ suggests: <b>${renderPert(last.chosen)}</b><br>` +
       `predicted Δ = <b>${(last.predicted||0).toFixed(3)}</b> ± <b>${(last.predicted_sd||0).toFixed(3)}</b><br>` +
       `observed = <b>${(last.observed||0).toFixed(3)}</b> ± <b>${(last.observed_sd||0).toFixed(3)}</b><br>` +
-      `RMSE <b>${last.rmse!=null?last.rmse.toFixed(3):"—"}</b> · R² <b>${last.r2!=null?last.r2.toFixed(3):"—"}</b>`;
+      surrogateQuality(last);
   } catch(e){ alert("active-learning: "+e.message); }
 });
 
@@ -728,6 +728,15 @@ function drawEnergies(es){
   ctx.stroke();
 }
 
+// Out-of-sample surrogate quality.  In-sample (training) RMSE/R² are not
+// shown: a boosted-tree fit drives them to ≈ 0 / ≈ 1 regardless of skill.
+function surrogateQuality(h){
+  const f = (v, d=3) => v!=null ? v.toFixed(d) : "—";
+  return `prospective RMSE <b>${f(h.prospective_rmse)}</b> · ` +
+         `LOO R² <b>${f(h.loo_r2)}</b> · ` +
+         `±1σ coverage <b>${h.coverage_1sigma!=null ? Math.round(100*h.coverage_1sigma)+"%" : "—"}</b>`;
+}
+
 function drawALHeatmap(history){
   const c = $("#al-heatmap"); const {ctx, w, h} = setupCanvas(c);
   ctx.clearRect(0,0,w,h);
@@ -803,12 +812,15 @@ function renderResult(r){
       `iteration <b>${last.iteration}</b> · tϕ suggests <b>${renderPert(last.chosen)}</b><br>` +
       `predicted <b>${last.predicted.toFixed(3)} ± ${last.predicted_sd.toFixed(3)}</b> · ` +
       `observed <b>${last.observed.toFixed(3)} ± ${last.observed_sd.toFixed(3)}</b><br>` +
+      surrogateQuality(last) + `<br>` +
       `converged residues: ${(r.al_converged_residues||[]).map(x=>`<span class="residue-pill">R${x}</span>`).join("")}`;
   }
   // cross-check
-  $("#cross-readout").innerHTML =
-    `agreement: ${(r.agreement_residues||[]).map(x=>`<span class="residue-pill agree">R${x}</span>`).join("") || "—"}<br>` +
-    `disagreement (discovery flags): ${(r.disagreement_residues||[]).map(x=>`<span class="residue-pill disagree">R${x}</span>`).join("") || "—"}`;
+  $("#cross-readout").innerHTML = r.cross_check_skipped
+    ? `cross-check skipped: ${r.cross_check_skipped}`
+    : `agreement: ${(r.agreement_residues||[]).map(x=>`<span class="residue-pill agree">R${x}</span>`).join("") || "—"}<br>` +
+      `discovery flags (trajectory only): ${(r.disagreement_residues||[]).map(x=>`<span class="residue-pill disagree">R${x}</span>`).join("") || "—"}<br>` +
+      `attention only: ${(r.attention_only_residues||[]).map(x=>`<span class="residue-pill">R${x}</span>`).join("") || "—"}`;
 
   // remember the discovery-flag residues so the user can light them up in 3D
   lastDiscoveries = (r.disagreement_residues || []).slice();

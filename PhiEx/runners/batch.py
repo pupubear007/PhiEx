@@ -67,23 +67,10 @@ def run_batch_payload(payload: dict) -> dict:
         if not loop.candidates:
             break
         r = loop.iterate()
-        results.append(_result_to_json(r))
+        results.append(r.to_json())
     return {
         "n_iterations": len(results),
         "history": results,
-    }
-
-
-def _result_to_json(r) -> dict:
-    return {
-        "iteration": r.iteration,
-        "chosen": r.chosen,
-        "predicted": r.predicted,
-        "predicted_sd": r.predicted_sd,
-        "observed": r.observed,
-        "observed_sd": r.observed_sd,
-        "rmse": r.surrogate_rmse,
-        "r2": r.surrogate_r2,
     }
 
 
