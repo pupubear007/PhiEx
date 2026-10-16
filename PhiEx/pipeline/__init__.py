@@ -7,6 +7,8 @@ new pipeline (e.g. plant chitinase) is mostly a copy of apx.py with the
 target's PDB id and ligand swapped.
 """
 
-from .apx import APXPipeline, APXPipelineResult, run_apx_pipeline
+from .apx import (APXPipeline, APXPipelineResult, run_apx_pipeline,
+                  resolve_working_structure)
 
-__all__ = ["APXPipeline", "APXPipelineResult", "run_apx_pipeline"]
+__all__ = ["APXPipeline", "APXPipelineResult", "run_apx_pipeline",
+           "resolve_working_structure"]

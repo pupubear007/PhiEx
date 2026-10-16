@@ -36,7 +36,11 @@ from pydantic import BaseModel
 from PhiEx.ticker import TICKER, log
 from PhiEx.device import select_device, describe_device, select_openmm_platform
 from PhiEx.core.theory import THEORIES
-from PhiEx.pipeline.apx import APXPipeline, APX_DEFAULT_PDB
+from PhiEx.pipeline.apx import (APXPipeline, APX_DEFAULT_PDB,
+                                resolve_working_structure, working_chain,
+                                log_site, pick_ligand, pose_contact_residues,
+                                rank_site_residues, build_mutation_evaluator, _AA1)
+from PhiEx.analysis.site import resolve_active_site, choose_active_pocket
 
 # adapters used by the per-stage routes
 from PhiEx.adapters.pdb import fetch_protein, parse_pdb_text, list_pdbs_for_uniprot
@@ -49,7 +53,7 @@ from PhiEx.adapters.diffdock import DiffDockAdapter
 from PhiEx.adapters.openmm_calc import OpenMMSimulator
 from PhiEx.adapters.mace import MACEAdapter, select_active_site_region
 from PhiEx.adapters.surrogate import GBRSurrogate, encode_perturbation
-from PhiEx.al import ActiveLearningLoop, UCBAcquisition, generate_mutation_panel
+from PhiEx.al import ActiveLearningLoop, make_acquisition, generate_mutation_panel
 
 from PhiEx.core.state import (Atom, Residue, Protein, Cofactor,
                                    Ligand, ComplexState, Pocket)
@@ -77,6 +81,22 @@ async def _startup() -> None:
     log("sys", f"openmm platform: {plat}  props={props}")
     SESSION["device"] = dev
     SESSION["openmm_platform"] = plat
+
+
+# ────────────────────────────────────────────────────────────────────────
+# errors — surface the cause instead of a bare "HTTP 500"
+# ────────────────────────────────────────────────────────────────────────
+
+@app.exception_handler(Exception)
+async def _unhandled(request: Request, exc: Exception) -> JSONResponse:
+    """Log the failure to the ticker and the server console, and return it
+    as {"error": ...} — the frontend's postJSON shows that field verbatim."""
+    import traceback
+    where = request.url.path
+    msg = f"{type(exc).__name__}: {exc}"
+    log("sys", f"{where} failed — {msg}")
+    traceback.print_exception(exc)
+    return JSONResponse({"error": f"{where}: {msg}"}, status_code=500)
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -127,7 +147,7 @@ async def api_ticker_history():
 
 
 @app.get("/api/uniprot/{uniprot_id}/pdbs")
-async def api_uniprot_pdbs(uniprot_id: str):
+def api_uniprot_pdbs(uniprot_id: str):
     """Return all PDB entries cross-referenced from a UniProt ID, best
     resolution first.  The frontend's "find PDB" button uses this."""
     entries = list_pdbs_for_uniprot(uniprot_id)
@@ -165,6 +185,11 @@ async def events(request: Request):
 
 # ────────────────────────────────────────────────────────────────────────
 # pipeline routes
+#
+# These are plain `def` handlers on purpose: they do blocking work (network
+# fetches, ESMFold, MD), and FastAPI runs sync handlers in its threadpool.
+# Declaring them `async def` would stall the event loop — and with it the
+# /events ticker stream — for the whole duration of each stage.
 # ────────────────────────────────────────────────────────────────────────
 
 class StructureRequest(BaseModel):
@@ -174,24 +199,21 @@ class StructureRequest(BaseModel):
 
 
 @app.post("/api/structure")
-async def api_structure(req: StructureRequest):
+def api_structure(req: StructureRequest):
     protein, cofactors, ann = fetch_protein(req.pdb_id, req.uniprot)
-    SESSION["protein"] = protein
-    SESSION["cofactors"] = cofactors
     SESSION["annotations"] = ann
     out: dict[str, Any] = {
         "experimental": _protein_summary(protein),
-        "cofactors": [{"name": c.name, "resname": c.resname,
-                       "metal": list(c.metal_atom.xyz) if c.metal_atom else None}
-                      for c in cofactors],
         "annotations": ann,
     }
+    predicted = None
     if req.run_esmfold and protein.sequence:
         esmfold = ESMFoldAdapter()
         if protein.residues:
             esmfold.set_reference(protein)
         THEORIES.register(esmfold)
-        pred = esmfold.predict(protein.sequence)
+        pred = esmfold.predict_chain(protein)
+        predicted = pred.value
         SESSION["predicted"] = pred.value
         out["predicted"] = _protein_summary(pred.value)
         out["predicted"]["mean_plddt"] = pred.meta.get("mean_plddt")
@@ -200,6 +222,20 @@ async def api_structure(req: StructureRequest):
         if protein.residues and pred.value.residues:
             out["rmsd_pred_vs_exp"] = ca_rmsd(pred.value, protein)
     out["experimental"]["pdb_text"] = protein.pdb_text
+
+    # same fallback as APXPipeline.run so the per-stage path and the
+    # one-shot pipeline operate on the same working structure
+    working, cofactors = resolve_working_structure(protein, cofactors, predicted)
+    SESSION["protein"] = working
+    SESSION["cofactors"] = cofactors
+    out["working_source"] = working.source
+    out["residue_labels"] = {r.index: f"{r.name.title()}{r.index}"
+                             for r in working_chain(working)[0]}
+    out["cofactors"] = [{"name": c.name, "resname": c.resname,
+                         "role": c.metadata.get("role", "cofactor"),
+                         "metal": list(c.metal_atom.xyz) if c.metal_atom else None,
+                         "stub": bool(c.metadata.get("stub", False))}
+                        for c in cofactors]
     return out
 
 
@@ -208,13 +244,14 @@ class AnnotateRequest(BaseModel):
 
 
 @app.post("/api/annotate")
-async def api_annotate(req: AnnotateRequest):
+def api_annotate(req: AnnotateRequest):
     protein: Protein = SESSION.get("protein")
     if not protein:
         return JSONResponse({"error": "call /api/structure first"}, status_code=400)
     esm2 = ESM2Adapter(); THEORIES.register(esm2)
     fs = FoldseekAdapter(); THEORIES.register(fs)
-    pred = esm2.predict(protein.sequence) if protein.sequence else None
+    chain_res, chain_seq = working_chain(protein)
+    pred = esm2.predict(chain_seq) if chain_seq else None
     fs_pred = fs.predict(protein, k=5)
     SESSION["esm2_pred"] = pred
     SESSION["foldseek"] = fs_pred
@@ -226,32 +263,46 @@ async def api_annotate(req: AnnotateRequest):
     }
 
 
+class PocketsRequest(BaseModel):
+    anchor: str | None = None     # e.g. "S197,H351"; None = auto-detect
+
+
 @app.post("/api/pockets")
-async def api_pockets():
+def api_pockets(req: PocketsRequest | None = None):
+    req = req or PocketsRequest()
     protein: Protein = SESSION.get("protein")
     cofactors = SESSION.get("cofactors") or []
     if not protein:
         return JSONResponse({"error": "call /api/structure first"}, status_code=400)
+    try:
+        site = resolve_active_site(protein, cofactors, req.anchor)
+    except ValueError as e:
+        return JSONResponse({"error": f"anchor: {e}"}, status_code=400)
     state = ComplexState(protein=protein, cofactors=tuple(cofactors))
     p2 = P2RankAdapter(); THEORIES.register(p2)
     pred = p2.predict(state)
-    SESSION["pockets"] = pred.value
+    active, site, pockets = choose_active_pocket(protein, pred.value, site,
+                                                 real_detector=not p2.is_stub)
+    log_site(site, active)
+    SESSION["pockets"] = pockets
+    SESSION["site"] = site
     return {
-        "pockets": [_pocket_json(p) for p in pred.value],
+        "pockets": [_pocket_json(p) for p in pockets],
         "score_sd": float(pred.uncertainty),
-        "active_site_id": next((p.id for p in pred.value if p.is_active_site), None),
+        "active_site_id": active.id if active else None,
+        "site": site.to_json(),
     }
 
 
 class DockRequest(BaseModel):
     pocket_id: str | None = None
     method: str = "vina"          # or "diffdock"
-    smiles: str | None = None     # default: ascorbate
-    ligand_name: str = "ascorbate"
+    smiles: str | None = None     # default: chosen from the site type
+    ligand_name: str = ""
 
 
 @app.post("/api/dock")
-async def api_dock(req: DockRequest):
+def api_dock(req: DockRequest):
     protein: Protein = SESSION.get("protein")
     cofactors = SESSION.get("cofactors") or []
     pockets: list[Pocket] = SESSION.get("pockets") or []
@@ -263,18 +314,76 @@ async def api_dock(req: DockRequest):
     if pocket is None:
         return JSONResponse({"error": "no pocket selected"}, status_code=400)
 
-    ligand = ASCORBATE if not req.smiles else Ligand(name=req.ligand_name, smiles=req.smiles)
-    state = ComplexState(protein=protein, cofactors=tuple(cofactors), ligands=(ligand,))
+    site = SESSION.get("site")
+    try:
+        ligand = pick_ligand(site, req.smiles, req.ligand_name)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    if ligand is None:
+        kind = site.kind if site else "unknown"
+        return JSONResponse({"error": f"no ligand given and no default substrate for a "
+                                      f"{kind} site — enter a SMILES or compound name in "
+                                      f"'Ligand' (or paste a list under stage 4 and press 4b)"},
+                            status_code=400)
+    state = ComplexState(protein=protein, cofactors=tuple(cofactors), ligands=(ligand,),
+                         metadata={"site_center": site.center} if site else {})
 
     if req.method == "diffdock":
         dd = DiffDockAdapter(); THEORIES.register(dd)
         poses = dd.predict(state, ligand, pocket).value
     else:
-        poses = VinaAdapter().dock(state, ligand, pocket)
+        try:
+            poses = VinaAdapter().dock(state, ligand, pocket)
+        except RuntimeError as e:
+            return JSONResponse({"error": str(e)}, status_code=422)
     SESSION["best_pose"] = poses[0] if poses else None
+    contacts = []
+    if poses and not poses[0].ligand.metadata.get("stub"):
+        contacts = pose_contact_residues(protein, poses[0], site.chain if site else None)
+        SESSION["pose_contacts"] = contacts
     return {"method": req.method,
+            "ligand": {"name": ligand.name, "smiles": ligand.smiles},
             "n_poses": len(poses),
+            "pose_contacts": contacts,
             "poses": [_pose_json(p) for p in poses]}
+
+
+class ScreenRequest(BaseModel):
+    ligands: str                  # one per line: SMILES, name, or "label: SMILES-or-name"
+    exhaustiveness: int = 8
+
+
+@app.post("/api/dock/batch")
+def api_dock_batch(req: ScreenRequest):
+    """Dock a list of ligands into the current site and rank them."""
+    from PhiEx.pipeline.screen import parse_ligand_list, screen_ligands
+    protein: Protein = SESSION.get("protein")
+    pockets: list[Pocket] = SESSION.get("pockets") or []
+    site = SESSION.get("site")
+    if not protein or not pockets:
+        return JSONResponse({"error": "run stages 1 and 3 (structure, site) first"},
+                            status_code=400)
+    pocket = next((p for p in pockets if p.is_active_site), pockets[0])
+    state = ComplexState(protein=protein, cofactors=tuple(SESSION.get("cofactors") or []),
+                         metadata={"site_center": site.center} if site else {})
+    try:
+        out = screen_ligands(state, pocket, site, parse_ligand_list(req.ligands),
+                             exhaustiveness=max(1, min(32, req.exhaustiveness)))
+    except (ValueError, RuntimeError) as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    SESSION["screen"] = out
+    return out
+
+
+@app.get("/api/dock/batch.csv")
+def api_dock_batch_csv():
+    from PhiEx.pipeline.screen import rows_to_csv
+    from fastapi.responses import Response
+    out = SESSION.get("screen")
+    if not out:
+        return JSONResponse({"error": "no screen run yet"}, status_code=404)
+    return Response(rows_to_csv(out["rows"]), media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=phiex_ligand_screen.csv"})
 
 
 class DynamicsRequest(BaseModel):
@@ -283,14 +392,16 @@ class DynamicsRequest(BaseModel):
 
 
 @app.post("/api/dynamics")
-async def api_dynamics(req: DynamicsRequest):
+def api_dynamics(req: DynamicsRequest):
     protein: Protein = SESSION.get("protein")
     cofactors = SESSION.get("cofactors") or []
     best = SESSION.get("best_pose")
     if not protein:
         return JSONResponse({"error": "call /api/structure first"}, status_code=400)
     ligs = (best.ligand,) if best else ()
-    state = ComplexState(protein=protein, cofactors=tuple(cofactors), ligands=ligs)
+    site = SESSION.get("site")
+    state = ComplexState(protein=protein, cofactors=tuple(cofactors), ligands=ligs,
+                         metadata={"site_center": site.center} if site else {})
 
     sim = OpenMMSimulator(total_ps=req.total_ps)
     traj = sim.run(state, label="api-dynamics")
@@ -318,9 +429,13 @@ async def api_dynamics(req: DynamicsRequest):
     contacts = ligand_residue_contacts(traj)
     out["top_contacts"] = contact_frequency(contacts, top_k=10)
     out["rmsf"] = rmsf_per_residue(traj)
-    metal = next((c.metal_atom for c in cofactors if c.metal_atom), None)
-    out["residence_ps_near_heme_fe"] = (
-        residence_time(traj, metal.xyz, cutoff_a=6.0) if metal else None)
+    res = None
+    if site is not None and traj.metadata.get("ligand_simulated", True):
+        res = residence_time(traj, site.center, cutoff_a=6.0)
+    out["residence_ps_near_site"] = res
+    out["residence_ps_near_heme_fe"] = res          # legacy key
+    out["ligand_simulated"] = bool(traj.metadata.get("ligand_simulated", True))
+    out["site"] = site.to_json() if site else None
     return out
 
 
@@ -331,43 +446,55 @@ class ALRequest(BaseModel):
 
 
 @app.post("/api/al/iterate")
-async def api_al(req: ALRequest):
+def api_al(req: ALRequest):
     protein: Protein = SESSION.get("protein")
     pockets = SESSION.get("pockets") or []
     if not protein or not pockets:
         return JSONResponse({"error": "run /api/structure and /api/pockets first"}, status_code=400)
     active = next((p for p in pockets if p.is_active_site), pockets[0])
+    site = SESSION.get("site")
+    chain_res, chain_seq = working_chain(protein)
+    ranked = (rank_site_residues(protein, active, site, limit=10) if site
+              else list(active.nearby_residues)[:10])
     candidates = req.candidates or generate_mutation_panel(
-        list(active.nearby_residues)[:8], protein.sequence, ["A", "K"])
+        ranked, protein.sequence, ["A", "K"],
+        residue_aa={r.index: _AA1.get(r.name.upper(), "X") for r in chain_res})
 
     surrogate = SESSION.get("surrogate") or GBRSurrogate(
-        sequence_length=max(1, len(protein.sequence)))
+        sequence_length=max(1, len(chain_seq)))
     THEORIES.register(surrogate)
     SESSION["surrogate"] = surrogate
 
-    # evaluator: cheap synthetic for the API path; real evaluator is wired
-    # by run_apx_pipeline.  README documents the swap.
-    from PhiEx.runners.batch import synthetic_evaluator
+    # evaluator: ESM-2 zero-shot mutation effect when stage 2 ran the real
+    # model; otherwise the labelled synthetic heuristic
+    best = SESSION.get("best_pose")
+    docked = ComplexState(protein=protein, cofactors=tuple(SESSION.get("cofactors") or []),
+                          ligands=(best.ligand,) if best else (),
+                          metadata={"site_center": site.center} if site else {})
+    evaluator, scoring = build_mutation_evaluator(SESSION.get("esm2_pred"), chain_res,
+                                                  MACEAdapter(), docked)
+    try:
+        acquisition = make_acquisition(req.acquisition)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
     loop = SESSION.get("al_loop")
     if loop is None or not getattr(surrogate, "_trained", False):
-        loop = ActiveLearningLoop(surrogate=surrogate, evaluator=synthetic_evaluator,
-                                   acquisition=UCBAcquisition())
+        log("t", f"AL objective: {scoring}")
+        loop = ActiveLearningLoop(surrogate=surrogate, evaluator=evaluator,
+                                   acquisition=acquisition)
         loop.seed(candidates[:5])
         loop.set_candidates(candidates[5:])
         SESSION["al_loop"] = loop
+    elif loop.acquisition.name != acquisition.name:
+        loop.acquisition = acquisition
 
     history: list[dict] = []
     for _ in range(req.n_iterations):
         if not loop.candidates: break
         r = loop.iterate()
-        loop.candidates = [c for c in loop.candidates if c != r.chosen]
-        history.append({
-            "iteration": r.iteration, "chosen": r.chosen,
-            "predicted": r.predicted, "predicted_sd": r.predicted_sd,
-            "observed": r.observed, "observed_sd": r.observed_sd,
-            "rmse": r.surrogate_rmse, "r2": r.surrogate_r2,
-        })
+        history.append(r.to_json())
     return {"history": history,
+            "scoring": scoring,
             "remaining_candidates": len(loop.candidates),
             "iteration": loop.iteration}
 
@@ -378,6 +505,10 @@ async def api_al(req: ALRequest):
 
 class APXRunRequest(BaseModel):
     pdb_id: str = APX_DEFAULT_PDB
+    uniprot: str | None = None        # None: taken from AF:<acc>, else APX default
+    anchor: str | None = None         # e.g. "S197,H351"; None = auto-detect
+    ligand_smiles: str | None = None  # None = default for the site type
+    ligand_name: str = ""
     md_total_ps: float = 10.0
     al_iterations: int = 3
     use_diffdock: bool = False
@@ -386,8 +517,15 @@ class APXRunRequest(BaseModel):
 
 @app.post("/api/apx/run")
 async def api_apx_run(req: APXRunRequest):
+    uniprot = req.uniprot
+    if not uniprot and ":" in req.pdb_id:
+        uniprot = req.pdb_id.split(":", 1)[1]          # AF:A7F474 → A7F474
     pipeline = APXPipeline(
         pdb_id=req.pdb_id,
+        **({"uniprot": uniprot} if uniprot else {}),
+        anchor=(req.anchor or None),
+        ligand_smiles=(req.ligand_smiles or None),
+        ligand_name=req.ligand_name,
         md_total_ps=req.md_total_ps,
         al_iterations=req.al_iterations,
         use_diffdock=req.use_diffdock,
@@ -399,16 +537,35 @@ async def api_apx_run(req: APXRunRequest):
         return _result_to_json(result)
 
     async def gen():
-        # interleave the ticker stream with a final result event.
+        # interleave the ticker stream with a final result event.  Wait on
+        # the next ticker event and the pipeline future together: the last
+        # event is usually logged *before* the future resolves, so waiting
+        # on events alone would block forever once the pipeline goes quiet.
         loop = asyncio.get_running_loop()
+        events = TICKER.subscribe(replay=False)
+        next_ev = asyncio.ensure_future(events.__anext__())
         future = loop.run_in_executor(None, pipeline.run)
-        async for ev in TICKER.subscribe(replay=False):
-            yield f"data: {ev.to_json()}\n\n"
-            if future.done():
-                break
-        result = await future
-        payload = json.dumps({"event": "done", "result": _result_to_json(result)})
-        yield f"data: {payload}\n\n"
+        try:
+            while True:
+                done, _ = await asyncio.wait({next_ev, future},
+                                             return_when=asyncio.FIRST_COMPLETED)
+                if next_ev in done:
+                    yield f"data: {next_ev.result().to_json()}\n\n"
+                    next_ev = asyncio.ensure_future(events.__anext__())
+                elif future in done:
+                    break
+            result = await future
+            payload = json.dumps({"event": "done", "result": _result_to_json(result)})
+            yield f"data: {payload}\n\n"
+        finally:
+            # cancelling the pending __anext__ unwinds the subscription (its
+            # finally unregisters the queue); wait for that before closing
+            next_ev.cancel()
+            try:
+                await next_ev
+            except (asyncio.CancelledError, StopAsyncIteration):
+                pass
+            await events.aclose()
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
@@ -438,6 +595,8 @@ def _pocket_json(p: Pocket) -> dict:
 def _pose_json(p) -> dict:
     return {
         "pose_id": p.pose_id, "score": p.score,
+        "stub": bool(p.ligand.metadata.get("stub")),
+        "crystal_rmsd": p.ligand.metadata.get("crystal_rmsd"),
         "score_uncertainty": p.score_uncertainty,
         "rmsd_to_best": p.rmsd_to_best,
         "ligand": {"name": p.ligand.name, "smiles": p.ligand.smiles,
@@ -452,4 +611,5 @@ def _result_to_json(r) -> dict:
     # contacts/rmsf carry int keys → strings for JSON
     out["contacts"] = {str(k): v for k, v in out["contacts"].items()}
     out["rmsf"] = {str(k): v for k, v in out["rmsf"].items()}
+    out["residue_labels"] = {str(k): v for k, v in out["residue_labels"].items()}
     return out

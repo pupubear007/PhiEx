@@ -36,11 +36,12 @@ ML models *are* the refined theory tφ. Not "models we use for prediction"
    DiffDock are all in there together.
 
 2. **They expose uncertainty.** `predict()` returns
-   `Prediction(value, uncertainty, meta)`. Uncertainty is required, not
-   optional. The UI cannot render an ML readout without an error bar
-   beside it. This is enforced by code shape (no `Optional` on
-   `uncertainty`) and by the right-hand panel's CSS — every readout is
-   `<value> ± <uncertainty>`.
+   `Prediction(value, uncertainty, meta)`. Every adapter is expected to
+   fill `uncertainty`; the UI cannot render an ML readout without an
+   error bar beside it — every readout in the right-hand panel is
+   `<value> ± <uncertainty>`. (The dataclass field itself still defaults
+   to `None`, so this is a convention checked by the unit tests, not by
+   the type system.)
 
 3. **They are updated by iteration `i`.** The active-learning loop
    (`PhiEx/al/loop.py`) is what advances the theory. Each `i ← i+1`
@@ -105,15 +106,19 @@ What happens, in framework terms:
 6. **s∃ ⟳ tϕ active learning over a mutation panel.** Generate ~10–20
    single-point mutations of active-site residues. Seed the surrogate
    with five cheap evaluations. Then three iterations of "rank by UCB →
-   evaluate the top → refit". The UI's heatmap fills in. The loop
-   converges on a small set of residues whose mutations produced the
-   largest observed Δ.
+   evaluate the top → refit". The objective is effect magnitude |Δ|, for
+   both acquisition and the final ranking. The UI's heatmap fills in. The
+   loop converges on a small set of residues whose mutations produced the
+   largest observed |Δ|. Surrogate quality is reported out-of-sample:
+   prospective RMSE, leave-one-out R², and ±1σ coverage.
 
-7. **Cross-check.** Compare those residues against the residues
-   highlighted by ESM-2's last-layer attention (column-wise mean
-   importance — a documented heuristic). Where they agree, confidence
-   ↑; where they disagree, the residue is flagged in red as a discovery
-   candidate.
+7. **Cross-check.** Compare those residues (plus residues in contact
+   with the ligand) against the residues highlighted by ESM-2's
+   last-layer attention (column-wise mean importance — a documented
+   heuristic). Where they agree, confidence ↑. A residue the trajectory
+   flags but attention does not is marked in red as a discovery
+   candidate; attention-only residues are listed but not flagged. The
+   cross-check is skipped when ESM-2 runs as a stub.
 
 ## Architecture
 
@@ -193,7 +198,75 @@ raising.
 ```
 make run            # FastAPI at http://localhost:8000, UI in browser
 make test           # apx_end_to_end sanity check
+make unit           # fast unit tests (pytest, no ML weights or network)
 ```
+
+## Using it on your own protein
+
+PhiEx is no longer tied to APX. For any structure (`1ABC`, or `AF:<UniProt>`
+for an AlphaFold model) it decides **where the active site is** before
+anything else, and every later stage — pocket, docking box, MD analysis,
+MACE region, mutation panel, discovery flags — is built around that site.
+
+**Site resolution, in priority order** (`PhiEx/analysis/site.py`):
+
+| # | source | when | confidence |
+|---|--------|------|------------|
+| 1 | **your anchor** — the *Site anchor* box / `anchor` API field, e.g. `S197,H351,E314`, `Ser197`, `A:197` | always wins | `user` |
+| 2 | **real cofactor** in the structure (heme Fe, FAD, NAD …) | crystal structures with HETATM cofactors | `high` |
+| 3 | **catalytic triad/dyad** found geometrically: Ser/Cys–His–Asp/Glu hydrogen-bond network (≤ 3.6 Å), boosted by a G‑x‑S‑x‑G nucleophile-elbow motif | serine / cysteine hydrolases, esterases, lipases, proteases | `high` with motif + acid, else `medium` |
+| 4 | **top P2Rank pocket** | nothing above found | `medium` (`low` with the geometric fallback) |
+| 5 | protein centroid | nothing at all | `low` |
+
+No cofactor is ever invented: the v0 code used to place a synthetic heme
+next to residue 42 (APX's catalytic His) on *every* protein, which put the
+whole downstream analysis in the wrong place for anything that is not APX.
+
+**Ligand:** give a SMILES in the *Ligand SMILES* box (`ligand_smiles` in
+the API). Without one, a default is chosen from the site type: hydrolase
+sites get p‑nitrophenyl acetate (the standard esterase assay substrate),
+everything else ascorbate.
+
+**What each stage now computes, and how real it is**
+
+| stage | real when | otherwise |
+|-------|-----------|-----------|
+| docking | `vina` + `meeko` + `rdkit` installed — receptor H added by meeko, 22 Å box on the site, cofactors near the site kept as rigid receptor atoms | labelled `[STUB]` poses |
+| pose contacts | real docking ran — residues ≤ 4 Å of the best pose | — |
+| MD | OpenMM: protein-only, chain holding the site, H added (pdbfixer rebuilds missing side-chain atoms), OBC2 implicit solvent, 2 fs; frames mapped back by (chain, residue, atom) so RMSF and contacts work. Uses the OpenCL GPU platform on Apple Silicon when available | stub harmonic trajectory, labelled |
+| residence time | — the ligand is **not** simulated (no small-molecule force field in v0); reported as *n/a* instead of a fake number | — |
+| mutation scores (AL objective) | ESM-2 loaded: zero-shot mutation effect, −LLR = log p(wt) − log p(mut) at that position (Meier et al. 2021). Larger = more disruptive. It does **not** model ligand binding | BLOSUM heuristic, labelled `SYNTHETIC` |
+| discovery flags | residues supported by AL / MD contacts / docked-pose contacts but not by ESM-2 attention | skipped when ESM-2 is a stub |
+
+**Hetero groups in the structure** (`classify_het` in `adapters/pdb.py`) are
+sorted by role: known **cofactors** (heme, FAD/FMN, NAD(P)(H), PLP, TPP, CoA,
+SAM/SAH, ATP/ADP/GTP/GDP, Fe–S clusters, molybdopterin, cobalamin, biotin,
+chlorophylls, …) and **catalytic metals** (Zn, Fe, Cu, Mn, Ni, Co, Mo, …)
+stay in the receptor and can define the site; **structural ions** (Ca, Mg)
+stay in the receptor but never define it; **co-crystallized ligands**
+(inhibitors, substrate analogs) define the site but are removed from the
+receptor — leave *Ligand* empty and PhiEx fetches the ligand's SMILES from
+RCSB and **re-docks it**, reporting the pose RMSD to the crystal (≤ 2 Å means
+docking reproduces the experimental binding mode). Waters, buffers,
+cryoprotectants, glycans and modified residues are ignored; MSE is read as
+Met. For AlphaFold models use the `AFILL:<UniProt>` entry — AlphaFill
+transplants cofactors and ligands from homologous structures.
+
+**Ligand screen** (stage 4b, `POST /api/dock/batch`, CSV at
+`/api/dock/batch.csv`): paste up to 50 ligands, one per line — a SMILES, a
+compound name (PubChem), or `label: SMILES-or-name`. Each is docked into the
+same site with the same settings and the table ranks them by Vina score with
+ligand efficiency (−score / heavy atoms), the site residues each pose touches,
+and distance to the site centre. Include a known substrate and a negative
+control: Vina scores carry ~±2 kcal/mol error, so trust the ranking and the
+contacts, not the absolute numbers.
+
+**How to read the discovery flags now:** they are site residues that the
+structure-based evidence (docked-pose contacts, MD contacts, mutation
+sensitivity) points to but sequence-level attention does not — candidates
+for mutagenesis around a site you trust. They are only as good as the
+site: check the *site* line in the Pockets panel (source + confidence)
+before using them.
 
 ## Known simplifications and stubs (called out explicitly)
 
@@ -204,18 +277,30 @@ do not bake them in elsewhere.
   `adapters/diffdock.py` has the exact signature the real model will
   fill. The stub generates plausible poses with a confidence head so
   the rest of the pipeline can run.
-* **Foldseek** is a stub for the APX example (canned plant-peroxidase
-  hits). Replace `_predict_real` with a real `foldseek easy-search`
-  call once the database is local.
-* **OpenMM heme parametrization** is the gap that most often forces the
-  stub MD path on real hardware. Production heme parametrization
-  requires GAFF or a custom XML; v0 falls back to a synthetic harmonic
-  trajectory if `ForceField.createSystem` fails on the cofactor. Logged
-  as `[STUB]` in the ticker.
-* **MACE region selection** uses the explicit heuristic
-  *"heme atoms first, ligand atoms second, nearest residues by
-  Cα-distance-to-Fe third, capped at 50 atoms"*. Documented in
-  `adapters/mace.py::select_active_site_region`.
+* **Foldseek** runs for real when `foldseek` is on PATH and a database
+  exists at `models/foldseek/pdb` (`make weights` downloads the PDB
+  database) or `$PHIEX_FOLDSEEK_DB`. It searches chain A only, drops the
+  query's own entry, and maps hits to GO terms via the PDBe SIFTS API
+  (cached in `models/foldseek/go_cache.json`). Otherwise it uses canned
+  APX neighbours.
+* **ESMFold** loads fair-esm if `openfold` is installed, otherwise the
+  Hugging Face `facebook/esmfold_v1` port (no openfold). It needs ≥ 32 GB
+  RAM (ESM-2 3B inside); below that it stays a stub unless
+  `PHIEX_ESMFOLD=force`. `PHIEX_ESMFOLD=off` disables it. Only one chain
+  is folded (`PHIEX_ESMFOLD_CHAIN`, default first chain), and Cα RMSD
+  is computed after Kabsch superposition.
+* **MACE-OFF23** runs on CPU by default (`PHIEX_MACE_DEVICE` to change):
+  the checkpoint is float64, which MPS cannot hold during loading.
+* **MD is protein-only.** The docked ligand and cofactors are held at
+  their input coordinates; residence time is therefore not computed.
+  Parametrizing the ligand (GAFF/OpenFF via `openmmforcefields`) is the
+  next step for ligand dynamics.
+* **MACE region selection**: ligand atoms first, cofactor atoms within
+  6 Å of the site second, nearest residues by Cα distance to the site
+  centre third, capped at 50 atoms; elements outside MACE-OFF23's
+  training set (e.g. Fe) are dropped. The region has no hydrogens or
+  caps, so its absolute energy is not physically meaningful — compare
+  values only between runs of the same system.
 * **Surrogate perturbation encoding** concatenates a small set of
   hand-picked features (one-hot type, residue position, BLOSUM62 score,
   temperature offset, Morgan-256 fingerprint). Documented in
@@ -224,8 +309,9 @@ do not bake them in elsewhere.
 * **ESM-2 attention probing** is a column-wise mean of the last-layer,
   mean-over-heads attention. Real attention probing per-head is
   post-v0.
-* **AL evaluator** in v0 is a cheap proxy: a MACE-region energy delta
-  perturbed by a BLOSUM-driven scalar. The interface
+* **AL evaluator** in v0 is a cheap proxy: a BLOSUM-driven |Δ| per
+  mutation, with the MACE-region ensemble σ as observation noise. The
+  structure is not mutated, so AL results reflect the proxy, not physics. The interface
   (`evaluator: dict -> (y, sigma)`) is the correct shape; production
   swaps in a real residence-time MD evaluator.
 
@@ -278,7 +364,7 @@ become a new field on `ComplexState` (e.g. `particles: tuple[Particle, ...]`).
 The simulator-shaped runner is `runners/readdy_simulator.py` mirroring
 `runners/simulator.py`.
 
-### Add a CUDA device branch in `device.py`
+### Add a CUDA device branch in `PhiEx/device.py`
 
 ```python
 def select_device(override=None):
@@ -317,7 +403,7 @@ The ticker is the producer side; the FastAPI SSE endpoint
 PhiEx/
 ├── environment.yml       authoritative conda spec (Mac MPS + Linux CPU)
 ├── Makefile              `make env`, `make weights`, `make run`, `make test`
-├── device.py             single source of truth for device selection
+├── device.py             shim re-exporting PhiEx/device.py
 ├── engine.py             scaffolding skeleton (the toy ϕ → ∃ demo)
 ├── index.html            scaffolding prototype (visual vocabulary)
 ├── README.md
@@ -327,7 +413,7 @@ PhiEx/
 │   └── main.py           FastAPI backend with SSE streaming
 ├── PhiEx/
 │   ├── __init__.py
-│   ├── device.py         re-export of root device.py
+│   ├── device.py         single source of truth for device selection
 │   ├── ticker.py         reasoning-ticker pub/sub
 │   ├── core/             State, Calculator, LearnedModel, Trajectory, FittedTheory
 │   ├── adapters/         pdb / esmfold / esm2 / foldseek / p2rank / vina /

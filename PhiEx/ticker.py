@@ -27,6 +27,7 @@ Every ML prediction MUST log uncertainty:
 from __future__ import annotations
 import asyncio
 import json
+import threading
 import time
 from dataclasses import dataclass, field, asdict
 from typing import AsyncIterator, Literal
@@ -55,7 +56,12 @@ class Ticker:
     """
 
     def __init__(self, history: int = 500) -> None:
-        self._subscribers: list[asyncio.Queue[Event]] = []
+        # each subscriber is (queue, the event loop that owns it).  Producers
+        # may run on worker threads (FastAPI threadpool, run_in_executor), and
+        # asyncio.Queue is not thread-safe, so off-loop puts are marshalled
+        # onto the owning loop with call_soon_threadsafe.
+        self._subscribers: list[tuple[asyncio.Queue[Event], asyncio.AbstractEventLoop]] = []
+        self._lock = threading.Lock()
         self._history: list[Event] = []
         self._history_max = history
 
@@ -64,14 +70,20 @@ class Ticker:
     # ──────────────────────────────────────────────────────────────
     def log(self, tag: Tag, msg: str, **extras) -> Event:
         ev = Event(tag=tag, msg=msg, extras=extras)
-        self._history.append(ev)
-        if len(self._history) > self._history_max:
-            self._history = self._history[-self._history_max:]
-        for q in list(self._subscribers):
-            try:
-                q.put_nowait(ev)
-            except asyncio.QueueFull:
-                pass
+        with self._lock:
+            self._history.append(ev)
+            if len(self._history) > self._history_max:
+                self._history = self._history[-self._history_max:]
+            subscribers = list(self._subscribers)
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
+        for q, loop in subscribers:
+            if loop is current:
+                _put_dropping(q, ev)
+            elif not loop.is_closed():
+                loop.call_soon_threadsafe(_put_dropping, q, ev)
         # also surface to stderr-style logging so headless runs (test, CLI)
         # see the same trace
         print(f"[{tag:>5}] {msg}", flush=True)
@@ -83,23 +95,37 @@ class Ticker:
     async def subscribe(self,
                         replay: bool = True) -> AsyncIterator[Event]:
         q: asyncio.Queue[Event] = asyncio.Queue(maxsize=1024)
-        self._subscribers.append(q)
+        entry = (q, asyncio.get_running_loop())
+        with self._lock:
+            self._subscribers.append(entry)
+            backlog = list(self._history) if replay else []
         try:
-            if replay:
-                for ev in list(self._history):
-                    yield ev
+            for ev in backlog:
+                yield ev
             while True:
                 yield await q.get()
         finally:
-            self._subscribers.remove(q)
+            with self._lock:
+                self._subscribers.remove(entry)
 
     def history(self) -> list[dict]:
-        return [asdict(ev) for ev in self._history]
+        with self._lock:
+            return [asdict(ev) for ev in self._history]
 
     def clear_history(self) -> None:
         """Wipe the replay buffer so a fresh page load shows nothing.
         Live subscribers are unaffected."""
-        self._history.clear()
+        with self._lock:
+            self._history.clear()
+
+
+def _put_dropping(q: "asyncio.Queue[Event]", ev: Event) -> None:
+    """Deliver to a subscriber queue, dropping the event if a slow client
+    has let the queue fill up."""
+    try:
+        q.put_nowait(ev)
+    except asyncio.QueueFull:
+        pass
 
 
 # Module-level singleton — there is exactly one ticker per process.

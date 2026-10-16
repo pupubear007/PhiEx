@@ -47,7 +47,8 @@ def main() -> int:
     print(f"  MD          : {result.n_md_frames} frames over {result.md_total_ps:.1f} ps")
     print(f"  MACE region : {result.mace_region_size} atoms; "
           f"E={result.mace_energy_mean} ± {result.mace_energy_sd}")
-    print(f"  residence   : {result.residence_ps_near_heme_fe:.2f} ps near heme Fe")
+    res = result.residence_ps_near_heme_fe
+    print(f"  residence   : {'unavailable' if res is None else f'{res:.2f} ps'} near heme Fe")
     print(f"  AL history  : {len(result.al_history)} iterations")
     if result.al_history:
         last = result.al_history[-1]
@@ -57,6 +58,8 @@ def main() -> int:
     print(f"  AL converged residues: {result.al_converged_residues}")
     print(f"  ESM-2 ↔ trajectory agreement: {result.agreement_residues}")
     print(f"  ESM-2 ↔ trajectory discovery flags: {result.disagreement_residues}")
+    if result.cross_check_skipped:
+        print(f"  cross-check skipped: {result.cross_check_skipped}")
     print(f"  theories registered: {[t['name'] for t in result.theories]}")
 
     if failures:

@@ -19,11 +19,13 @@ shown explicitly: "tϕ suggests: mutate R38 → K, predicted Δactivity = 0.3 ±
 from .acquisition import (
     AcquisitionFunction, UCBAcquisition,
     ExpectedImprovementAcquisition, ThompsonAcquisition,
+    ACQUISITIONS, make_acquisition,
 )
 from .loop import ActiveLearningLoop, ALIterationResult, generate_mutation_panel
 
 __all__ = [
     "AcquisitionFunction", "UCBAcquisition",
     "ExpectedImprovementAcquisition", "ThompsonAcquisition",
+    "ACQUISITIONS", "make_acquisition",
     "ActiveLearningLoop", "ALIterationResult", "generate_mutation_panel",
 ]

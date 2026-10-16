@@ -34,9 +34,26 @@ class ALIterationResult:
     predicted_sd: float
     observed: float
     observed_sd: float
-    surrogate_rmse: Optional[float]
-    surrogate_r2: Optional[float]
+    surrogate_rmse: Optional[float]          # in-sample fit — optimistic
+    surrogate_r2: Optional[float]            # in-sample fit — optimistic
+    loo_r2: Optional[float] = None           # leave-one-out R²
+    # Prospective metrics over every iteration so far: each prediction was
+    # made *before* its observation, so these are honest out-of-sample
+    # scores of the surrogate as the loop actually used it.
+    prospective_rmse: Optional[float] = None
+    coverage_1sigma: Optional[float] = None  # fraction with |obs−pred| ≤ σ_pred
     converged_residues: list[int] = field(default_factory=list)
+
+    def to_json(self) -> dict:
+        return {
+            "iteration": self.iteration, "chosen": self.chosen,
+            "predicted": self.predicted, "predicted_sd": self.predicted_sd,
+            "observed": self.observed, "observed_sd": self.observed_sd,
+            "train_rmse": self.surrogate_rmse, "train_r2": self.surrogate_r2,
+            "loo_r2": self.loo_r2,
+            "prospective_rmse": self.prospective_rmse,
+            "coverage_1sigma": self.coverage_1sigma,
+        }
 
 
 @dataclass
@@ -47,6 +64,10 @@ class ActiveLearningLoop:
     candidates: list[dict] = field(default_factory=list)
     history: list[ALIterationResult] = field(default_factory=list)
     iteration: int = 0
+    # every (encoded perturbation, observation) pair seen so far — the
+    # training set the surrogate is refit on each iteration
+    _X: list = field(default_factory=list, repr=False)
+    _y: list = field(default_factory=list, repr=False)
 
     # ──────────────────────────────────────────────────────────────
     def seed(self, perturbations: list[dict]) -> None:
@@ -54,13 +75,12 @@ class ActiveLearningLoop:
         give the surrogate a starting tϕ.  Logged with i=0."""
         log("i", f"───── iteration i = 0 (seed batch, n={len(perturbations)}) ─────")
         X, y = [], []
-        from ..adapters.surrogate import encode_perturbation
         for p in perturbations:
             obs, sd = self.evaluator(p)
-            x = encode_perturbation(p)
-            X.append(x); y.append(obs)
+            X.append(self._encode(p)); y.append(obs)
             log("s", f"seed run: {self._render_pert(p)} → y={obs:.3f} ± {sd:.3f}")
-        report = self.surrogate.fit(X, y)
+        self._X.extend(X); self._y.extend(y)
+        report = self.surrogate.fit(list(self._X), list(self._y))
         log("t", f"tϕ seeded: surrogate fit on {report.n_samples} samples")
 
     # ──────────────────────────────────────────────────────────────
@@ -91,18 +111,12 @@ class ActiveLearningLoop:
         observed, observed_sd = self.evaluator(chosen)
         log("s", f"observed: y = {observed:.3f} ± {observed_sd:.3f}")
 
-        # 3) refit
-        from ..adapters.surrogate import encode_perturbation
-        x = encode_perturbation(chosen)
-        if hasattr(self.surrogate, "_x_buffer"):
-            X = self.surrogate._x_buffer + [x]
-            y = self.surrogate._y_buffer + [observed]
-        else:
-            X, y = [x], [observed]
-        report = self.surrogate.fit(X, y)
-        log("t", f"tϕ refit: n={report.n_samples}  "
-                  f"RMSE={report.rmse}  R²={report.r2}")
+        # an evaluated candidate is no longer a candidate
+        self.candidates = [c for c in self.candidates if c != chosen]
 
+        # 3) refit on everything observed so far (seed batch + iterations)
+        self._X.append(self._encode(chosen)); self._y.append(observed)
+        report = self.surrogate.fit(list(self._X), list(self._y))
         # 4) record + return
         result = ALIterationResult(
             iteration=self.iteration, chosen=chosen,
@@ -110,9 +124,28 @@ class ActiveLearningLoop:
             predicted_sd=float(predicted.uncertainty or 0.0),
             observed=observed, observed_sd=observed_sd,
             surrogate_rmse=report.rmse, surrogate_r2=report.r2,
+            loo_r2=getattr(report, "loo_r2", None),
         )
         self.history.append(result)
+        errs = [h.observed - h.predicted for h in self.history]
+        result.prospective_rmse = (sum(e * e for e in errs) / len(errs)) ** 0.5
+        result.coverage_1sigma = sum(
+            abs(h.observed - h.predicted) <= h.predicted_sd for h in self.history
+        ) / len(self.history)
+        log("t", f"tϕ prospective: RMSE={result.prospective_rmse:.3f}  "
+                  f"±1σ coverage={100 * result.coverage_1sigma:.0f}% "
+                  f"over {len(self.history)} predictions")
         return result
+
+    # ──────────────────────────────────────────────────────────────
+    def _encode(self, p: dict) -> "list[float]":
+        """Encode with the surrogate's own encoder so the training features
+        match what `surrogate.predict` computes (same sequence length)."""
+        encode = getattr(self.surrogate, "encode", None)
+        if encode is not None:
+            return encode(p)
+        from ..adapters.surrogate import encode_perturbation
+        return encode_perturbation(p)
 
     # ──────────────────────────────────────────────────────────────
     def _render_pert(self, p: dict) -> str:
@@ -131,7 +164,8 @@ class ActiveLearningLoop:
 
 def generate_mutation_panel(active_site_residues: list[int],
                             sequence: str,
-                            substitutions: list[str] = None) -> list[dict]:
+                            substitutions: list[str] = None,
+                            residue_aa: "dict[int, str] | None" = None) -> list[dict]:
     """Build a small mutation panel for the AL loop.  By default we
     mutate every active-site residue to A, K, and the conservative
     substitute (R→K, D→E, F→Y …).  Documented in README as the v0
@@ -141,9 +175,15 @@ def generate_mutation_panel(active_site_residues: list[int],
     conservative = {"R":"K","K":"R","D":"E","E":"D","F":"Y","Y":"F",
                     "S":"T","T":"S","I":"V","V":"I","L":"V","M":"I"}
     for resid in active_site_residues:
-        if resid - 1 < 0 or resid - 1 >= len(sequence):
-            continue
-        wt = sequence[resid - 1].upper()
+        if residue_aa is not None:
+            # structure numbering (PDB resseq) need not equal sequence index
+            wt = (residue_aa.get(resid) or "").upper()
+            if not wt or wt == "X":
+                continue
+        else:
+            if resid - 1 < 0 or resid - 1 >= len(sequence):
+                continue
+            wt = sequence[resid - 1].upper()
         for to in subs:
             if to != wt:
                 panel.append({"type": "mutation", "residue": resid,

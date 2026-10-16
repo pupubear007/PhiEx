@@ -148,11 +148,17 @@ downloaded all the real weights.
    times.  This is the **s∃ ⟳ tφ** loop.
 7. **Cross-check.**  Compare the residues the simulation says matter
    against the residues ESM-2's attention map says matter.  Agreement
-   = confirmation.  Disagreement = a discovery flag.
+   = confirmation.  A residue the simulation flags but attention does
+   not = a discovery flag.  (Skipped when ESM-2 runs as a stub.)
 
-If everything goes right, the AL loop converges on **Trp41 / His42** —
-the canonical distal-side catalytic pair of plant peroxidases.  The
-system has rediscovered known biology, blind, from a sequence.
+> **What the AL result does and doesn't mean (v0).**  The stage-6
+> evaluator is a cheap proxy — a BLOSUM62-based score per mutation, not a
+> simulation of the mutated structure — so the residues it converges on
+> reflect that formula, not the enzyme's physics.  The loop machinery
+> (surrogate, acquisition, refit) is real; the science it is fed is not
+> yet.  The target is for the loop to recover the canonical distal-side
+> catalytic pair of plant peroxidases, **Trp41 / His42**, once a
+> structure-based evaluator replaces the proxy (see `ROADMAP.md`).
 
 ---
 
@@ -165,11 +171,14 @@ system has rediscovered known biology, blind, from a sequence.
 * **Pockets** — pocket id, score, and whether it was flagged as the
   active site (look for the yellow `★`).
 * **AL history** — one row per iteration showing the chosen mutation,
-  the predicted Δ-energy ± uncertainty, and the observed value.  If
-  predictions and observations track each other, the surrogate is
-  learning the right thing.
-* **Discovery flags** — residues where the simulation and ESM-2
-  disagree.  These are the most interesting candidates for follow-up.
+  the predicted effect size |Δ| ± uncertainty, and the observed value.
+  Below it: *prospective RMSE* (error of each prediction made before its
+  observation), *LOO R²* (leave-one-out), and *±1σ coverage* (how often
+  the observation fell inside the predicted error bar; ≈68% means the
+  error bars are honest).
+* **Discovery flags** — residues the simulation flags that ESM-2
+  attention does not.  These are the most interesting candidates for
+  follow-up.
 
 ---
 

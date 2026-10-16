@@ -66,8 +66,7 @@ class P2RankAdapter(LearnedModelBase):
         scores = [p.score for p in pockets]
         sd = _stddev(scores) if scores else 0.0
         log("phi" if not self.is_stub else "s",
-            f"P2Rank ∃: {len(pockets)} pocket(s); active-site flagged at "
-            f"{next((p.id for p in pockets if p.is_active_site), 'none')}  "
+            f"P2Rank{'' if not self.is_stub else '[STUB]'} ∃: {len(pockets)} pocket(s)  "
             f"score σ={sd:.2f}")
         return Prediction(value=list(pockets), uncertainty=sd,
                           meta={"model": self.name, "device": self.device,

@@ -12,21 +12,25 @@ from __future__ import annotations
 import math
 
 from ..core.trajectory import Trajectory
+from .topology import frame_matches
 
 
-def ligand_residue_contacts(traj: Trajectory, cutoff_a: float = 4.0) -> dict[int, float]:
-    """Return per-residue contact-frequency over the trajectory."""
+def ligand_residue_contacts(traj: Trajectory, cutoff_a: float = 4.0,
+                            chain: "str | None" = None) -> dict[int, float]:
+    """Return per-residue contact-frequency over the trajectory, for one
+    chain (default: the chain the MD simulated — homo-oligomers repeat
+    residue numbers)."""
     state = traj.parent_state
+    chain = chain if chain is not None else traj.metadata.get("md_chain")
     if not traj.frames or not state.ligands:
         return {}
 
     # build per-residue heavy-atom index lists from frame 0 ordering.
-    flat = list(state.protein.all_atoms())
     res_atoms: dict[int, list[int]] = {}
     idx = 0
     for r in state.protein.residues:
         for a in r.atoms:
-            if a.element.upper() != "H":
+            if a.element.upper() != "H" and (chain is None or r.chain == chain):
                 res_atoms.setdefault(r.index, []).append(idx)
             idx += 1
     n_protein_atoms = idx
@@ -41,7 +45,7 @@ def ligand_residue_contacts(traj: Trajectory, cutoff_a: float = 4.0) -> dict[int
     counts: dict[int, int] = {}
     n_frames = 0
     for frame in traj.frames:
-        if not frame.positions:
+        if not frame.positions or not frame_matches(traj, frame):
             continue
         n_frames += 1
         # ligand atoms positions (heavy atoms only)
@@ -67,7 +71,9 @@ def ligand_residue_contacts(traj: Trajectory, cutoff_a: float = 4.0) -> dict[int
             if in_contact:
                 counts[resid] = counts.get(resid, 0) + 1
 
-    return {r: counts.get(r, 0) / max(1, n_frames) for r in res_atoms}
+    if n_frames == 0:
+        return {}
+    return {r: counts.get(r, 0) / n_frames for r in res_atoms}
 
 
 def contact_frequency(map_: dict[int, float], top_k: int = 10) -> list[tuple[int, float]]:
