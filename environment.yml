@@ -99,3 +99,11 @@ dependencies:
       - fair-esm            # ESM-2 and ESMFold (pip canonical)
       - mace-torch          # MACE-OFF ML potential
       - scikit-optimize     # Bayesian acquisition for active learning
+      # ESMFold without openfold (fair-esm's ESMFold needs openfold, which
+      # does not build on Apple Silicon).  Pinned to a range that still
+      # supports the conda PyTorch 2.2 build.
+      - "transformers>=4.40,<4.47"
+      - "accelerate>=0.30,<1.1"
+      # pip ignores the conda-side numpy pin above; without repeating it
+      # here mace-torch's dependencies pull NumPy 2, which breaks torch.
+      - "numpy<2"

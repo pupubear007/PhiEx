@@ -24,6 +24,7 @@ swap; the README documents the recipe.
 
 from __future__ import annotations
 import math
+import os
 import random
 from dataclasses import dataclass
 from typing import Optional
@@ -52,12 +53,38 @@ class ESMFoldAdapter(LearnedModelBase):
         self._maybe_load()
 
     def _maybe_load(self) -> None:
+        """Load real ESMFold, or fall back to the stub.
+
+        Order of attempts:
+            0. gate on PHIEX_ESMFOLD (auto|off|force) and on physical RAM —
+               ESMFold runs ESM-2 3B underneath (~12 GB fp32 weights), so on
+               a 16 GB Mac `auto` keeps the stub instead of swapping hard.
+            1. fair-esm `esm.pretrained.esmfold_v1()`  (needs `openfold`,
+               which rarely builds on Apple Silicon)
+            2. Hugging Face `transformers.EsmForProteinFolding`
+               (facebook/esmfold_v1) — no openfold dependency.
+        Both expose `infer_pdb(sequence) -> str`, so `_predict_real` is shared.
+        """
+        mode = os.environ.get("PHIEX_ESMFOLD", "auto").strip().lower()
+        if mode == "off":
+            self.is_stub = True
+            self.backend = "stub (disabled via PHIEX_ESMFOLD=off)"
+            log("t", f"ESMFold adapter: {self.backend}")
+            return
+        min_gb = float(os.environ.get("PHIEX_ESMFOLD_MIN_GB", "32"))
+        ram_gb = _physical_ram_gb()
+        if mode != "force" and ram_gb is not None and ram_gb < min_gb:
+            self.is_stub = True
+            self.backend = (f"stub ({ram_gb:.0f} GB RAM < {min_gb:.0f} GB needed; "
+                            f"set PHIEX_ESMFOLD=force to try anyway)")
+            log("t", f"ESMFold adapter: {self.backend}")
+            return
+
         try:
-            import esm  # noqa: F401
             import torch  # noqa: F401
         except ImportError:
             self.is_stub = True
-            self.backend = "stub (esm package not installed)"
+            self.backend = "stub (torch not installed)"
             log("t", f"ESMFold adapter: {self.backend} → predict() will synthesise")
             return
 
@@ -67,24 +94,81 @@ class ESMFoldAdapter(LearnedModelBase):
             log("t", f"ESMFold adapter: {self.backend}")
             return
 
+        errors: list[str] = []
+        model, label = None, ""
+        # 1) fair-esm
         try:
             import esm
             model = esm.pretrained.esmfold_v1()
-            model = model.eval()
-            try:
-                model = model.to(self.device)
-            except Exception as e:
-                log("sys", f"ESMFold .to({self.device}) failed: {e}; using cpu")
-                self.device = "cpu"
-                model = model.to("cpu")
-            self._model = model
-            self.backend = f"fair-esm ESMFold v1 on {self.device}"
-            log("t", f"ESMFold loaded: {self.backend}, "
-                     f"info={describe_device(self.device)}")
+            label = "fair-esm ESMFold v1"
         except Exception as e:
+            errors.append(f"fair-esm: {e}")
+        # 2) Hugging Face transformers
+        if model is None:
+            try:
+                from transformers import EsmForProteinFolding  # type: ignore
+                log("t", "ESMFold: fair-esm unavailable; loading Hugging Face "
+                         "facebook/esmfold_v1 (first load downloads several GB)")
+                model = EsmForProteinFolding.from_pretrained(
+                    "facebook/esmfold_v1", cache_dir=_hf_cache_dir(),
+                    low_cpu_mem_usage=True)
+                label = "HF transformers ESMFold v1"
+            except Exception as e:
+                errors.append(f"transformers: {e}")
+
+        if model is None:
             self.is_stub = True
-            self.backend = f"stub (ESMFold load failed: {e})"
-            log("sys", f"ESMFold load failed, falling back to stub: {e}")
+            self.backend = f"stub (ESMFold load failed: {'; '.join(errors)})"
+            log("sys", f"ESMFold load failed, falling back to stub: {'; '.join(errors)}")
+            return
+
+        model = model.eval()
+        self._configure_for_device(model)
+        try:
+            model = model.to(self.device)
+        except Exception as e:
+            log("sys", f"ESMFold .to({self.device}) failed: {e}; using cpu")
+            self.device = "cpu"
+            model = model.float().to("cpu")
+        self._model = model
+        self.is_stub = False
+        self.backend = f"{label} on {self.device}"
+        log("t", f"ESMFold loaded: {self.backend}, "
+                 f"info={describe_device(self.device)}")
+
+    def _configure_for_device(self, model) -> None:
+        """Memory savers.  The ESM-2 3B language-model trunk in fp16 halves
+        its footprint on GPU/MPS (CPU keeps fp32: fp16 matmuls are slow or
+        unsupported there).  Chunking the folding trunk trades speed for
+        peak memory."""
+        if self.device in ("mps", "cuda") and hasattr(model, "esm"):
+            try:
+                model.esm = model.esm.half()
+            except Exception as e:  # pragma: no cover
+                log("sys", f"ESMFold: fp16 trunk not applied ({e})")
+        trunk = getattr(model, "trunk", None)
+        if trunk is not None and hasattr(trunk, "set_chunk_size"):
+            trunk.set_chunk_size(int(os.environ.get("PHIEX_ESMFOLD_CHUNK", "64")))
+
+    def predict_chain(self, protein: Protein, name: str = "predicted") -> Prediction:
+        """Fold ONE chain of `protein`.
+
+        `Protein.sequence` from a PDB entry is every chain concatenated
+        (1APX: 4 × 249 = 996 residues).  ESMFold would fold that as a single
+        996-residue chain — slow and physically meaningless.  We fold the
+        first chain (or PHIEX_ESMFOLD_CHAIN) and record which one, so the
+        RMSD compares like with like.
+        """
+        chain, seq = select_chain_sequence(
+            protein, os.environ.get("PHIEX_ESMFOLD_CHAIN") or None)
+        if chain and len(seq) < len(protein.sequence or ""):
+            log("phi", f"ESMFold: folding chain {chain} only "
+                       f"({len(seq)} of {len(protein.sequence)} residues)")
+        pred = self.predict(seq, name=name)
+        if chain:
+            pred.value.metadata["query_chain"] = chain
+            pred.meta["query_chain"] = chain
+        return pred
 
     def set_reference(self, reference: Protein) -> None:
         """Optionally provide an experimental structure so the stub path
@@ -106,8 +190,20 @@ class ESMFoldAdapter(LearnedModelBase):
     def _predict_real(self, sequence: str, name: str) -> Prediction:
         import torch
         log("phi", f"ESMFold: predicting {len(sequence)}-residue structure on {self.device}")
-        with torch.no_grad():
-            output = self._model.infer_pdb(sequence)
+        try:
+            with torch.no_grad():
+                output = self._model.infer_pdb(sequence)
+        except Exception as e:
+            if self.device == "cpu":
+                raise
+            log("sys", f"ESMFold forward on {self.device} failed "
+                       f"({type(e).__name__}: {e}); retrying on cpu")
+            self.device = "cpu"
+            self._model = self._model.float().to("cpu")
+            self.backend = self.backend.rsplit(" on ", 1)[0] + " on cpu"
+            with torch.no_grad():
+                output = self._model.infer_pdb(sequence)
+        output = _rescale_plddt_if_fractional(output)
         # output is PDB text. parse with our PDB adapter so we stay in core types
         from .pdb import parse_pdb_text
         protein, _ = parse_pdb_text(output, name=name)
@@ -249,26 +345,111 @@ def _serialise_pdb_minimal(residues: tuple[Residue, ...],
 # ────────────────────────────────────────────────────────────────────────
 
 def ca_rmsd(pred: Protein, exp: Protein) -> Optional[float]:
-    """Cα RMSD over residues present in both structures (no alignment).
+    """Cα RMSD after optimal superposition (Kabsch).
 
-    For the v0 sandbox we don't run a full superposition; this is a
-    sanity-check metric, not a benchmark.  README documents this
-    simplification.
+    Pairing:
+        * if most predicted residues share (chain, index) keys with the
+          experimental structure (the stub copies them), pair by key;
+        * otherwise (real ESMFold numbers its single chain A 1..N), pair
+          by position along the folded chain — `metadata["query_chain"]`,
+          or the first experimental chain.
+    Real predictions live in an arbitrary frame, so superposition is
+    required; without it the number would be tens of Å regardless of
+    prediction quality.
     """
     if not pred.residues or not exp.residues:
         return None
     pred_by = {(r.chain, r.index): r for r in pred.residues}
     exp_by = {(r.chain, r.index): r for r in exp.residues}
     common = sorted(set(pred_by) & set(exp_by))
-    if not common:
+    pairs: list[tuple[Atom, Atom]] = []
+    if len(common) >= 0.9 * len(pred.residues):
+        for k in common:
+            a, b = pred_by[k].ca, exp_by[k].ca
+            if a and b:
+                pairs.append((a, b))
+    else:
+        chain = (pred.metadata or {}).get("query_chain") or exp.residues[0].chain
+        exp_chain = [r for r in exp.residues if r.chain == chain]
+        for rp, re_ in zip(pred.residues, exp_chain):
+            if rp.ca and re_.ca:
+                pairs.append((rp.ca, re_.ca))
+    if len(pairs) < 3:
         return None
-    sq_sum, n = 0.0, 0
-    for k in common:
-        ca_p, ca_e = pred_by[k].ca, exp_by[k].ca
-        if not (ca_p and ca_e): continue
-        dx = ca_p.xyz[0] - ca_e.xyz[0]
-        dy = ca_p.xyz[1] - ca_e.xyz[1]
-        dz = ca_p.xyz[2] - ca_e.xyz[2]
-        sq_sum += dx*dx + dy*dy + dz*dz
-        n += 1
-    return math.sqrt(sq_sum / n) if n else None
+    return _kabsch_rmsd([p.xyz for p, _ in pairs], [e.xyz for _, e in pairs])
+
+
+def _kabsch_rmsd(P, Q) -> float:
+    import numpy as np
+    P = np.asarray(P, dtype=float); Q = np.asarray(Q, dtype=float)
+    P = P - P.mean(axis=0); Q = Q - Q.mean(axis=0)
+    H = P.T @ Q
+    U, S, Vt = np.linalg.svd(H)
+    d = np.sign(np.linalg.det(Vt.T @ U.T))
+    D = np.diag([1.0, 1.0, d])
+    R = Vt.T @ D @ U.T
+    diff = (R @ P.T).T - Q
+    return float(np.sqrt((diff ** 2).sum() / len(P)))
+
+
+# ────────────────────────────────────────────────────────────────────────
+# chain / environment helpers
+# ────────────────────────────────────────────────────────────────────────
+
+_THREE_TO_ONE = {v: k for k, v in _ONE_TO_THREE.items()}
+
+
+def select_chain_sequence(protein: Protein,
+                          chain: Optional[str] = None) -> "tuple[Optional[str], str]":
+    """(chain_id, one-letter sequence) for one chain of a structure.
+    Sequence-only proteins return (None, protein.sequence)."""
+    if not protein.residues:
+        return None, protein.sequence or ""
+    chains: list[str] = []
+    for r in protein.residues:
+        if r.chain not in chains:
+            chains.append(r.chain)
+    pick = chain if chain in chains else chains[0]
+    seq = "".join(_THREE_TO_ONE.get(r.name.upper(), "X")
+                  for r in protein.residues if r.chain == pick)
+    return pick, seq
+
+
+def _physical_ram_gb() -> Optional[float]:
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
+    except (ValueError, OSError, AttributeError):
+        pass
+    try:
+        import subprocess
+        out = subprocess.run(["sysctl", "-n", "hw.memsize"],
+                             capture_output=True, text=True, timeout=5)
+        return int(out.stdout.strip()) / 1e9
+    except Exception:
+        return None
+
+
+def _hf_cache_dir() -> Optional[str]:
+    """Same place `make weights` puts Hugging Face downloads."""
+    if os.environ.get("HF_HOME"):
+        return None                      # let transformers honour HF_HOME
+    models = os.environ.get("PHIEX_MODELS_DIR")
+    return os.path.join(os.path.abspath(models), "hf", "hub") if models else None
+
+
+def _rescale_plddt_if_fractional(pdb_text: str) -> str:
+    """Some ESMFold builds write pLDDT as 0–1 in the B-factor column.
+    The rest of PhiEx (and the Mol* colouring) expects 0–100."""
+    rows = [l for l in pdb_text.splitlines() if l.startswith("ATOM")]
+    try:
+        bmax = max(float(l[60:66]) for l in rows) if rows else 100.0
+    except ValueError:
+        return pdb_text
+    if bmax > 1.0:
+        return pdb_text
+    out = []
+    for l in pdb_text.splitlines():
+        if l.startswith("ATOM") and len(l) >= 66:
+            l = l[:60] + f"{float(l[60:66]) * 100:6.2f}" + l[66:]
+        out.append(l)
+    return "\n".join(out) + "\n"

@@ -133,7 +133,7 @@ class APXPipeline:
             log("sys", "no sequence — skipping ESMFold step")
             predicted = None
         else:
-            pred = esmfold.predict(protein.sequence, name="APX-pred")
+            pred = esmfold.predict_chain(protein, name="APX-pred")
             predicted = pred.value
             result.predicted_pdb_text = predicted.pdb_text
             result.mean_plddt = pred.meta.get("mean_plddt")

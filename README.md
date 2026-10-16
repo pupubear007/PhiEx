@@ -210,9 +210,20 @@ do not bake them in elsewhere.
   `adapters/diffdock.py` has the exact signature the real model will
   fill. The stub generates plausible poses with a confidence head so
   the rest of the pipeline can run.
-* **Foldseek** is a stub for the APX example (canned plant-peroxidase
-  hits). Replace `_predict_real` with a real `foldseek easy-search`
-  call once the database is local.
+* **Foldseek** runs for real when `foldseek` is on PATH and a database
+  exists at `models/foldseek/pdb` (`make weights` downloads the PDB
+  database) or `$PHIEX_FOLDSEEK_DB`. It searches chain A only, drops the
+  query's own entry, and maps hits to GO terms via the PDBe SIFTS API
+  (cached in `models/foldseek/go_cache.json`). Otherwise it uses canned
+  APX neighbours.
+* **ESMFold** loads fair-esm if `openfold` is installed, otherwise the
+  Hugging Face `facebook/esmfold_v1` port (no openfold). It needs ≥ 32 GB
+  RAM (ESM-2 3B inside); below that it stays a stub unless
+  `PHIEX_ESMFOLD=force`. `PHIEX_ESMFOLD=off` disables it. Only one chain
+  is folded (`PHIEX_ESMFOLD_CHAIN`, default first chain), and Cα RMSD
+  is computed after Kabsch superposition.
+* **MACE-OFF23** runs on CPU by default (`PHIEX_MACE_DEVICE` to change):
+  the checkpoint is float64, which MPS cannot hold during loading.
 * **Trajectory analysis requires a matching atom layout.** Contacts,
   RMSF and residence index frame positions in the order protein →
   cofactors → ligands. The real OpenMM path builds its system from the

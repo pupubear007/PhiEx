@@ -321,3 +321,57 @@ def test_api_errors_are_reported_not_bare_500(monkeypatch):
         main.SESSION.pop("protein", None)
     assert r.status_code == 500
     assert "simulated failure" in r.json()["error"]
+
+
+# ────────────────────────────────────────────────────────────────────────
+# ESMFold helpers: single-chain folding and superposed RMSD
+# ────────────────────────────────────────────────────────────────────────
+
+def _ca_res(i, chain, xyz, name="ALA"):
+    return Residue(index=i, name=name, chain=chain,
+                   atoms=(Atom(i, "CA", "C", xyz),))
+
+
+def test_select_chain_sequence_picks_one_chain():
+    from PhiEx.adapters.esmfold import select_chain_sequence
+    res = tuple([_ca_res(1, "A", (0, 0, 0), "HIS"), _ca_res(2, "A", (1, 0, 0), "ARG"),
+                 _ca_res(1, "B", (0, 5, 0), "TRP")])
+    p = Protein(name="x", sequence="HRW", residues=res)
+    assert select_chain_sequence(p) == ("A", "HR")
+    assert select_chain_sequence(p, "B") == ("B", "W")
+    assert select_chain_sequence(Protein(name="s", sequence="ACD")) == (None, "ACD")
+
+
+def test_ca_rmsd_is_superposition_invariant():
+    import math as _m
+    from PhiEx.adapters.esmfold import ca_rmsd
+    pts = [(0, 0, 0), (3.8, 0, 0), (3.8, 3.8, 0), (0, 3.8, 1.0), (1.0, 1.0, 4.0)]
+    exp = Protein(name="e", residues=tuple(_ca_res(10 + i, "A", p) for i, p in enumerate(pts)))
+    # rotate 90° about z and translate; renumber as ESMFold would (chain A, 1..N)
+    rot = [(-y + 7, x - 3, z + 2) for x, y, z in pts]
+    pred = Protein(name="p", residues=tuple(_ca_res(1 + i, "A", p) for i, p in enumerate(rot)),
+                   metadata={"query_chain": "A"})
+    assert ca_rmsd(pred, exp) < 1e-6
+
+
+def test_esmfold_off_switch_keeps_stub(monkeypatch):
+    from PhiEx.adapters.esmfold import ESMFoldAdapter
+    monkeypatch.setenv("PHIEX_ESMFOLD", "off")
+    a = ESMFoldAdapter(device="cpu")
+    assert a.is_stub and "PHIEX_ESMFOLD=off" in a.backend
+
+
+def test_foldseek_target_parsing_and_single_chain():
+    from PhiEx.adapters.foldseek import _pdb_id_from_target, _single_chain_pdb
+    assert _pdb_id_from_target("1oag-assembly1.cif.gz_A") == "1oag"
+    assert _pdb_id_from_target("2CCA_B") == "2cca"
+    assert _pdb_id_from_target("AF-Q9XXX-F1-model_v4") is None
+    pdb = ("ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 0.00           C\n"
+           "ATOM      2  CA  ALA B   1       1.000   0.000   0.000  1.00 0.00           C\n")
+    text, chain = _single_chain_pdb(Protein(name="t", pdb_text=pdb))
+    assert chain == "A" and text.count("ATOM") == 1
+
+
+def test_mace_defaults_to_cpu(monkeypatch):
+    monkeypatch.delenv("PHIEX_MACE_DEVICE", raising=False)
+    assert MACEAdapter().device == "cpu"

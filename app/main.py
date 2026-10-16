@@ -209,7 +209,7 @@ def api_structure(req: StructureRequest):
         if protein.residues:
             esmfold.set_reference(protein)
         THEORIES.register(esmfold)
-        pred = esmfold.predict(protein.sequence)
+        pred = esmfold.predict_chain(protein)
         predicted = pred.value
         SESSION["predicted"] = pred.value
         out["predicted"] = _protein_summary(pred.value)
