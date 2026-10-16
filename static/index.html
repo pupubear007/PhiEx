@@ -176,7 +176,7 @@
     <div class="row"><label>MD ps</label><input id="i-ps" type="number" min="1" max="50" value="10" step="1"></div>
     <div class="row"><label>AL i steps</label><input id="i-iter" type="number" min="1" max="10" value="3" step="1"></div>
     <div class="row" title="Residues that define the active site, e.g. S197,H351,E314. Leave empty to auto-detect (cofactor → catalytic triad → top pocket)."><label>Site anchor</label><input id="i-anchor" type="text" placeholder="auto  (e.g. S197,H351)"></div>
-    <div class="row" title="Ligand to dock, as SMILES. Leave empty for a default chosen from the site type (hydrolase → p-nitrophenyl acetate; heme → ascorbate)."><label>Ligand SMILES</label><input id="i-smiles" type="text" placeholder="auto by site type"></div>
+    <div class="row" title="Ligand to dock: a SMILES string (e.g. CCCC(=O)Oc1ccc(cc1)[N+](=O)[O-]) or a compound name looked up on PubChem (e.g. p-nitrophenyl butyrate). Leave empty for a default chosen from the site type (hydrolase → p-nitrophenyl acetate; heme → ascorbate; otherwise none)."><label>Ligand</label><input id="i-smiles" type="text" placeholder="SMILES or name · empty = auto"></div>
 
     <h2><span class="sym">ϕ → ∃</span>PIPELINE STAGES</h2>
     <button class="btn phi" id="run-structure">1 ▸ STRUCTURE  (PDB + ESMFold)</button>

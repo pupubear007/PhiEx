@@ -314,7 +314,10 @@ def api_dock(req: DockRequest):
         return JSONResponse({"error": "no pocket selected"}, status_code=400)
 
     site = SESSION.get("site")
-    ligand = pick_ligand(site, req.smiles, req.ligand_name)
+    try:
+        ligand = pick_ligand(site, req.smiles, req.ligand_name)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
     if ligand is None:
         kind = site.kind if site else "unknown"
         return JSONResponse({"error": f"no ligand given and no default substrate for a "
@@ -327,7 +330,10 @@ def api_dock(req: DockRequest):
         dd = DiffDockAdapter(); THEORIES.register(dd)
         poses = dd.predict(state, ligand, pocket).value
     else:
-        poses = VinaAdapter().dock(state, ligand, pocket)
+        try:
+            poses = VinaAdapter().dock(state, ligand, pocket)
+        except RuntimeError as e:
+            return JSONResponse({"error": str(e)}, status_code=422)
     SESSION["best_pose"] = poses[0] if poses else None
     contacts = []
     if poses and not poses[0].ligand.metadata.get("stub"):
@@ -549,6 +555,7 @@ def _pocket_json(p: Pocket) -> dict:
 def _pose_json(p) -> dict:
     return {
         "pose_id": p.pose_id, "score": p.score,
+        "stub": bool(p.ligand.metadata.get("stub")),
         "score_uncertainty": p.score_uncertainty,
         "rmsd_to_best": p.rmsd_to_best,
         "ligand": {"name": p.ligand.name, "smiles": p.ligand.smiles,

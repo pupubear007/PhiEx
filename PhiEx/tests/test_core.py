@@ -574,3 +574,44 @@ def test_dock_route_refuses_to_guess_a_ligand():
         for k in ("protein", "pockets", "site"):
             main.SESSION.pop(k, None)
     assert r.status_code == 400 and "SMILES" in r.json()["error"]
+
+
+# ────────────────────────────────────────────────────────────────────────
+# ligand input: SMILES or name; failures are errors, not fake poses
+# ────────────────────────────────────────────────────────────────────────
+
+def test_ligand_input_accepts_smiles_and_names(monkeypatch):
+    from PhiEx.adapters import vina as V
+    lig = V.resolve_ligand_input("CCCC(=O)Oc1ccc(cc1)[N+](=O)[O-]", "pNPB")
+    assert lig.name == "pNPB" and lig.smiles.startswith("CCCC")
+    monkeypatch.setattr(V, "_pubchem_smiles", lambda n: "CC(=O)O" if n == "acetic acid" else None)
+    assert V.resolve_ligand_input("acetic acid").smiles == "CC(=O)O"
+    with pytest.raises(ValueError, match="not a valid SMILES"):
+        V.resolve_ligand_input("SMILES")
+
+
+def test_real_docking_failure_raises_instead_of_fake_poses(monkeypatch):
+    from PhiEx.adapters.vina import VinaAdapter
+    a = VinaAdapter()
+    a.is_stub = False
+    monkeypatch.setattr(a, "_dock_real", lambda *x: (_ for _ in ()).throw(ValueError("bad")))
+    with pytest.raises(RuntimeError, match="docking failed"):
+        a.dock(_toy_complex(), Ligand(name="x", smiles="C"), Pocket(id="P", center=(0, 0, 0), score=1))
+
+
+def test_dock_route_rejects_unparseable_ligand(monkeypatch):
+    from fastapi.testclient import TestClient
+    import app.main as main
+    from PhiEx.adapters import vina as V
+    from PhiEx.analysis.site import ActiveSite
+    monkeypatch.setattr(V, "_pubchem_smiles", lambda n: None)
+    main.SESSION["protein"] = _triad_protein()
+    main.SESSION["pockets"] = [Pocket(id="P1", center=(0, 0, 0), score=1.0, is_active_site=True)]
+    main.SESSION["site"] = ActiveSite(center=(0, 0, 0), source="pocket", label="p", confidence="low")
+    try:
+        with TestClient(main.app, raise_server_exceptions=False) as c:
+            r = c.post("/api/dock", json={"method": "vina", "smiles": "SMILES"})
+    finally:
+        for k in ("protein", "pockets", "site"):
+            main.SESSION.pop(k, None)
+    assert r.status_code == 400 and "not a valid SMILES" in r.json()["error"]

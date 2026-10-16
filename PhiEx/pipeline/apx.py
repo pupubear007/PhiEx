@@ -38,7 +38,8 @@ from ..adapters.esmfold import ESMFoldAdapter, ca_rmsd
 from ..adapters.esm2 import ESM2Adapter, attention_residue_importance, mutation_llr
 from ..adapters.foldseek import FoldseekAdapter, aggregate_go_terms
 from ..adapters.p2rank import P2RankAdapter
-from ..adapters.vina import VinaAdapter, ASCORBATE, default_ligand_for_site
+from ..adapters.vina import (VinaAdapter, ASCORBATE, default_ligand_for_site,
+                            resolve_ligand_input)
 from ..adapters.diffdock import DiffDockAdapter
 from ..adapters.openmm_calc import OpenMMSimulator
 from ..adapters.mace import MACEAdapter, select_active_site_region
@@ -80,6 +81,7 @@ class APXPipelineResult:
     ligand: dict = field(default_factory=dict)          # {"name", "smiles", "default"}
     poses: list = field(default_factory=list)
     pose_contacts: list = field(default_factory=list)   # residues ≤ 4 Å of best pose
+    docking_error: Optional[str] = None
 
     # stage 5
     n_md_frames: int = 0
@@ -197,18 +199,26 @@ class APXPipeline:
             log("sys", "no pocket — skipping docking")
             poses = []
         else:
-            ligand = pick_ligand(site, self.ligand_smiles, self.ligand_name)
+            try:
+                ligand = pick_ligand(site, self.ligand_smiles, self.ligand_name)
+            except ValueError as e:
+                log("sys", f"ligand: {e} — docking skipped")
+                result.docking_error = str(e)
+                ligand = None
             result.ligand = ({"name": ligand.name, "smiles": ligand.smiles,
                               "default": not self.ligand_smiles} if ligand else {})
-            if ligand is None:
-                poses = []
-            elif self.use_diffdock:
-                dd = DiffDockAdapter()
-                THEORIES.register(dd)
-                poses = dd.predict(state, ligand, active).value
-            else:
-                vina = VinaAdapter()
-                poses = vina.dock(state, ligand, active)
+            poses = []
+            if ligand is not None:
+                try:
+                    if self.use_diffdock:
+                        dd = DiffDockAdapter()
+                        THEORIES.register(dd)
+                        poses = dd.predict(state, ligand, active).value
+                    else:
+                        poses = VinaAdapter().dock(state, ligand, active)
+                except RuntimeError as e:
+                    result.docking_error = str(e)
+                    log("sys", f"{e} — continuing without a docked ligand")
         result.poses = [_pose_to_json(p) for p in poses]
         if poses and not poses[0].ligand.metadata.get("stub", False):
             result.pose_contacts = pose_contact_residues(protein, poses[0], site.chain)
@@ -353,6 +363,7 @@ def _pocket_to_json(p) -> dict:
 def _pose_to_json(p) -> dict:
     return {
         "pose_id": p.pose_id, "score": p.score,
+        "stub": bool(p.ligand.metadata.get("stub")),
         "score_uncertainty": p.score_uncertainty,
         "rmsd_to_best": p.rmsd_to_best,
         "ligand": {"name": p.ligand.name, "smiles": p.ligand.smiles,
@@ -420,7 +431,7 @@ def pick_ligand(site: Optional[ActiveSite], smiles: Optional[str],
     """The user's SMILES if given; else a default only when the site type
     implies one; else None (caller skips docking and says why)."""
     if smiles:
-        return Ligand(name=name or "custom ligand", smiles=smiles)
+        return resolve_ligand_input(smiles, name)      # ValueError if unusable
     lig = default_ligand_for_site(site)
     kind = getattr(site, "kind", "unknown")
     if lig is None:

@@ -336,6 +336,7 @@ $("#run-dock").addEventListener("click", async () => {
     drawPoses(r.poses);
     $("#poses-readout").innerHTML =
       `<b>${r.ligand ? r.ligand.name : "ligand"}</b>: <b>${r.n_poses}</b> poses · best <b>${(r.poses[0]||{}).score?.toFixed(2)}</b> kcal/mol` +
+      (((r.poses||[])[0]||{}).stub ? ` <span style="color:var(--warn, #c66)">[STUB — synthetic poses, Vina not installed]</span>` : "") +
       ((r.pose_contacts||[]).length ? `<br>contacts: ${r.pose_contacts.map(pill).join("")}` : "");
   } catch(e){ alert("dock: "+e.message); }
 });
@@ -823,8 +824,11 @@ function renderResult(r){
   $("#poses-readout").innerHTML = (r.poses||[]).length
     ? `<b>${(r.ligand||{}).name || "ligand"}</b>${(r.ligand||{}).default ? ' <span style="color:var(--ink-dim)">(default for this site)</span>' : ""}: ` +
       `<b>${r.poses.length}</b> poses · best <b>${r.poses[0].score.toFixed(2)}</b> kcal/mol` +
+      (r.poses[0].stub ? ` <span style="color:var(--warn, #c66)">[STUB — synthetic poses]</span>` : "") +
       ((r.pose_contacts||[]).length ? `<br>contacts: ${r.pose_contacts.map(pill).join("")}` : "")
-    : `no ligand docked — no default substrate for this site type; enter a SMILES in <b>Ligand SMILES</b>`;
+    : (r.docking_error
+        ? `<span style="color:var(--warn, #c66)">no ligand docked — ${r.docking_error}</span>`
+        : `no ligand docked — no default substrate for this site type; enter a SMILES or compound name in <b>Ligand</b>`);
 
   // dynamics
   drawEnergies(r.energies_ev);

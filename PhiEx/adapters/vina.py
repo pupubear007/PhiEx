@@ -58,8 +58,10 @@ class VinaAdapter:
         try:
             return self._dock_real(state, ligand, pocket)
         except Exception as e:
-            log("sys", f"Vina real run failed ({type(e).__name__}: {e}); falling back to stub")
-            return self._dock_stub(state, ligand, pocket)
+            # Do NOT quietly substitute synthetic poses: a fake score next
+            # to a real ligand name reads as a result.  Fail loudly.
+            log("sys", f"Vina docking failed ({type(e).__name__}: {e})")
+            raise RuntimeError(f"docking failed: {e}") from e
 
     # ──────────────────────────────────────────────────────────────
     # real: meeko receptor + ligand prep, Vina search in a box on the site
@@ -290,3 +292,62 @@ def _rmsd_same_order(a, b) -> float:
     if not a or len(a) != len(b):
         return 0.0
     return math.sqrt(sum(math.dist(p, q) ** 2 for p, q in zip(a, b)) / len(a))
+
+
+# ────────────────────────────────────────────────────────────────────────
+# ligand input: SMILES or a compound name
+# ────────────────────────────────────────────────────────────────────────
+
+_NAME_CACHE: dict = {}
+
+
+def resolve_ligand_input(text: str, name: str = "") -> Ligand:
+    """Turn what the user typed into a Ligand.
+
+    * a valid SMILES (checked with RDKit) is used as-is;
+    * otherwise the text is treated as a compound name and looked up on
+      PubChem (e.g. "p-nitrophenyl butyrate", "tributyrin", "ascorbic acid");
+    * otherwise ValueError with a message the UI can show.
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("empty ligand")
+    try:
+        from rdkit import Chem, RDLogger
+        RDLogger.DisableLog("rdApp.*")
+        mol = Chem.MolFromSmiles(text)
+    except ImportError:
+        mol = None
+    if mol is not None and mol.GetNumAtoms() > 0:
+        return Ligand(name=name or "custom ligand", smiles=text)
+    smiles = _pubchem_smiles(text)
+    if smiles:
+        log("s", f"ligand: '{text}' resolved on PubChem → {smiles}")
+        return Ligand(name=name or text, smiles=smiles,
+                      metadata={"source": "pubchem", "query": text})
+    raise ValueError(f"'{text}' is not a valid SMILES and was not found on PubChem "
+                     f"by name — enter a SMILES (e.g. CCCC(=O)Oc1ccc(cc1)[N+](=O)[O-]) "
+                     f"or a compound name (e.g. p-nitrophenyl butyrate)")
+
+
+def _pubchem_smiles(name: str) -> "str | None":
+    key = name.lower()
+    if key in _NAME_CACHE:
+        return _NAME_CACHE[key]
+    try:
+        import httpx
+        from urllib.parse import quote
+        url = ("https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
+               f"{quote(name)}/property/SMILES,IsomericSMILES,CanonicalSMILES/JSON")
+        r = httpx.get(url, timeout=10.0, headers={"User-Agent": "PhiEx/0.1"})
+        if r.status_code != 200:
+            _NAME_CACHE[key] = None
+            return None
+        props = (r.json().get("PropertyTable", {}).get("Properties") or [{}])[0]
+        smi = (props.get("SMILES") or props.get("IsomericSMILES")
+               or props.get("CanonicalSMILES"))
+        _NAME_CACHE[key] = smi
+        return smi
+    except Exception as e:
+        log("sys", f"PubChem lookup for '{name}' failed ({e})")
+        return None
