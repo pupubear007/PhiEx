@@ -71,6 +71,15 @@
   aside .row { display: flex; justify-content: space-between; align-items: center; padding: 4px 0; }
   aside .row label { color: var(--ink-dim); }
   aside .row .val { color: var(--ink); font-variant-numeric: tabular-nums; }
+  aside textarea {
+    width: 100%; box-sizing: border-box; margin: 4px 0; resize: vertical;
+    background: var(--bg, #0b0e12); color: var(--ink, #ddd); border: 1px solid var(--line, #333);
+    font: 11px/1.4 ui-monospace, Menlo, monospace; padding: 6px;
+  }
+  .screen-table { width: 100%; border-collapse: collapse; font-size: 10.5px; }
+  .screen-table th, .screen-table td { padding: 2px 4px; text-align: left; border-bottom: 1px solid rgba(127,127,127,.2); vertical-align: top; }
+  .screen-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .screen-table tr.err td { color: var(--ink-dim); }
   aside input[type=range], aside input[type=number], aside input[type=text] {
     width: 130px; accent-color: var(--phi); background: var(--bg);
     color: var(--ink); border: 1px solid var(--rule); padding: 3px 6px;
@@ -183,6 +192,9 @@
     <button class="btn phi" id="run-annotate">2 ▸ ANNOTATE   (ESM-2 + Foldseek)</button>
     <button class="btn phi" id="run-pockets">3 ▸ SITE + POCKETS  (anchor / cofactor / triad / P2Rank)</button>
     <button class="btn phi" id="run-dock">4 ▸ DOCK       (Vina adapter)</button>
+    <textarea id="i-ligands" rows="4" spellcheck="false" title="One ligand per line: a SMILES, a compound name (PubChem), or label: SMILES-or-name. Up to 50."
+      placeholder="screen list — one per line, e.g.&#10;p-nitrophenyl acetate&#10;p-nitrophenyl butyrate&#10;C8: CCCCCCCC(=O)Oc1ccc(cc1)[N+](=O)[O-]&#10;tributyrin"></textarea>
+    <button class="btn phi" id="run-screen">4b ▸ SCREEN LIGANDS  (dock list, rank)</button>
     <button class="btn phi" id="run-dynamics">5 ▸ DYNAMICS  (OpenMM + MACE region)</button>
 
     <h2><span class="sym">s∃ ⟳ tϕ</span>INDUCTIVE</h2>
@@ -196,7 +208,7 @@
 
     <h2><span class="sym">∃</span>STATE</h2>
     <div class="readout" id="state-readout">
-      protein: <b>—</b><br>cofactors: <b>—</b><br>active site: <b>—</b>
+      protein: <b>—</b><br>hetero groups: <b>—</b><br>active site: <b>—</b>
     </div>
   </aside>
 
@@ -230,6 +242,9 @@
     <h2><span class="sym">s∃</span>DOCKING POSES</h2>
     <div class="readout" id="poses-readout">no poses yet</div>
     <canvas class="chart" id="poses-chart"></canvas>
+
+    <h2><span class="sym">s∃</span>LIGAND SCREEN</h2>
+    <div class="readout" id="screen-readout">paste ligands under stage 4 and press 4b</div>
 
     <h2><span class="sym">ϕ → ∃</span>MD ENERGIES</h2>
     <canvas class="chart" id="energy-chart"></canvas>

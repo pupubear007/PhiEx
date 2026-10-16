@@ -71,7 +71,7 @@ class VinaAdapter:
         from vina import Vina  # type: ignore
         import tempfile, os
         center = [float(c) for c in pocket.center]
-        rec = prepare_receptor_pdbqt(state, center)
+        rec = _receptor_cached(state, center)
         lig_pdbqt = prepare_ligand_pdbqt(ligand.smiles, seed=self.seed)
         log("phi", f"Vina: docking {ligand.name} into {pocket.id} "
                    f"(box {self.box_size:.0f} Å at {tuple(round(c,1) for c in center)}, "
@@ -96,15 +96,24 @@ class VinaAdapter:
             if first_xyz is None:
                 first_xyz = [a.xyz for a in atoms]
             rmsd = _rmsd_same_order([a.xyz for a in atoms], first_xyz)
+            meta = {k2: v2 for k2, v2 in ligand.metadata.items() if k2 != "crystal_ref"}
+            ref = ligand.metadata.get("crystal_ref")
+            if ref:
+                meta["crystal_rmsd"] = crystal_pose_rmsd(atoms, ref)
             poses.append(DockingPose(
                 ligand=Ligand(name=ligand.name, smiles=ligand.smiles, atoms=atoms,
-                              metadata={**ligand.metadata, "pdbqt_model": k}),
+                              metadata={**meta, "pdbqt_model": k}),
                 score=float(e[0]), score_uncertainty=0.0, pose_id=k,
                 rmsd_to_best=rmsd))
         if not poses:
             raise RuntimeError("Vina returned no poses")
         log("s", f"Vina s∃: {len(poses)} poses; best = {poses[0].score:.2f} kcal/mol "
                  f"(range {poses[0].score:.2f} … {poses[-1].score:.2f})")
+        r0 = poses[0].ligand.metadata.get("crystal_rmsd")
+        if r0 is not None:
+            verdict = "reproduces" if r0 <= 2.0 else "does NOT reproduce"
+            log("s", f"re-dock check: best pose is {r0:.2f} Å from the crystal pose — "
+                     f"docking {verdict} the experimental binding mode (≤ 2 Å)")
         return poses
 
     # ──────────────────────────────────────────────────────────────
@@ -176,6 +185,11 @@ def default_ligand_for_site(site) -> "Ligand | None":
     kind = getattr(site, "kind", "") or ""
     if kind in ("serine-hydrolase", "cysteine-hydrolase"):
         return PNP_ACETATE
+    if kind == "ligand-site" and getattr(site, "bound_ligand", None):
+        lig = ligand_from_chem_comp(site.bound_ligand)
+        if lig is not None:
+            lig.metadata["crystal_ref"] = site.bound_ligand_xyz
+            return lig
     if (getattr(site, "cofactor", "") or "").upper().startswith("HEME"):
         return ASCORBATE
     return None
@@ -186,8 +200,9 @@ def default_ligand_for_site(site) -> "Ligand | None":
 # ────────────────────────────────────────────────────────────────────────
 
 _AD_COFACTOR_TYPES = {"C": "C", "N": "N", "O": "OA", "S": "SA", "P": "P",
+                      "F": "F", "CL": "Cl", "BR": "Br", "I": "I",
                       "FE": "Fe", "ZN": "Zn", "MG": "Mg", "MN": "Mn",
-                      "CA": "Ca", "CU": "Cu"}
+                      "CA": "Ca", "CU": "Cu", "NI": "Ni", "CO": "Co"}
 
 
 def _near_chains(state: ComplexState, center, radius: float = 20.0) -> set:
@@ -197,6 +212,22 @@ def _near_chains(state: ComplexState, center, radius: float = 20.0) -> set:
             if math.dist(a.xyz, center) <= radius:
                 chains.add(r.chain); break
     return chains
+
+
+_RECEPTOR_CACHE: dict = {}
+
+
+def _receptor_cached(state: ComplexState, center) -> str:
+    """Receptor prep (meeko + H placement) is the slow part of a dock and is
+    identical for every ligand in a screen — cache it per structure/site."""
+    key = (state.protein.name, len(state.protein.residues),
+           tuple(round(c, 1) for c in center),
+           tuple(sorted((c.resname, c.metadata.get("role", "")) for c in state.cofactors)))
+    if key not in _RECEPTOR_CACHE:
+        if len(_RECEPTOR_CACHE) > 8:
+            _RECEPTOR_CACHE.clear()
+        _RECEPTOR_CACHE[key] = prepare_receptor_pdbqt(state, center)
+    return _RECEPTOR_CACHE[key]
 
 
 def prepare_receptor_pdbqt(state: ComplexState, center) -> str:
@@ -228,6 +259,8 @@ def prepare_receptor_pdbqt(state: ComplexState, center) -> str:
     for c in state.cofactors:
         if c.metadata.get("stub") or not c.atoms:
             continue
+        if c.metadata.get("role") == "ligand":
+            continue        # the co-crystallized ligand vacates the site for docking
         if min(math.dist(a.xyz, center) for a in c.atoms) > 12.0:
             continue
         for a in c.atoms:
@@ -351,3 +384,49 @@ def _pubchem_smiles(name: str) -> "str | None":
     except Exception as e:
         log("sys", f"PubChem lookup for '{name}' failed ({e})")
         return None
+
+
+def ligand_from_chem_comp(comp_id: str) -> "Ligand | None":
+    """SMILES of a PDB chemical component (e.g. a co-crystallized ligand)
+    from the RCSB chem-comp API, so it can be re-docked."""
+    try:
+        import httpx
+        r = httpx.get(f"https://data.rcsb.org/rest/v1/core/chemcomp/{comp_id.upper()}",
+                      timeout=10.0, headers={"User-Agent": "PhiEx/0.1"})
+        if r.status_code != 200:
+            return None
+        d = r.json()
+        desc = d.get("rcsb_chem_comp_descriptor") or {}
+        smi = desc.get("smilesstereo") or desc.get("smiles")
+        name = (d.get("chem_comp") or {}).get("name") or comp_id
+        if not smi:
+            return None
+        log("s", f"ligand: co-crystallized {comp_id} ({name.lower()}) → re-docking")
+        return Ligand(name=f"{comp_id} (co-crystal)", smiles=smi,
+                      metadata={"source": "rcsb-chemcomp", "comp_id": comp_id})
+    except Exception as e:
+        log("sys", f"RCSB chem-comp lookup for {comp_id} failed ({e})")
+        return None
+
+
+def crystal_pose_rmsd(pose_atoms, ref) -> "float | None":
+    """Heavy-atom RMSD between a docked pose and the crystal pose, with
+    atoms matched by element (Hungarian assignment) — PDBQT and PDB atom
+    orders differ.  < 2 Å is the usual 'docking reproduced the crystal' bar."""
+    try:
+        import numpy as np
+        from scipy.optimize import linear_sum_assignment
+    except ImportError:
+        return None
+    pa = [(a.element.upper(), a.xyz) for a in pose_atoms if a.element.upper() != "H"]
+    if not pa or not ref or abs(len(pa) - len(ref)) > max(2, 0.2 * len(ref)):
+        return None
+    total, n = 0.0, 0
+    for el in {e for e, _ in pa}:
+        P = np.array([x for e, x in pa if e == el]); Q = np.array([x for e, x in ref if e == el])
+        if len(Q) == 0:
+            continue
+        D = ((P[:, None, :] - Q[None, :, :]) ** 2).sum(-1)
+        i, j = linear_sum_assignment(D)
+        total += float(D[i, j].sum()); n += len(i)
+    return (total / n) ** 0.5 if n else None

@@ -238,6 +238,29 @@ everything else ascorbate.
 | mutation scores (AL objective) | ESM-2 loaded: zero-shot mutation effect, −LLR = log p(wt) − log p(mut) at that position (Meier et al. 2021). Larger = more disruptive. It does **not** model ligand binding | BLOSUM heuristic, labelled `SYNTHETIC` |
 | discovery flags | residues supported by AL / MD contacts / docked-pose contacts but not by ESM-2 attention | skipped when ESM-2 is a stub |
 
+**Hetero groups in the structure** (`classify_het` in `adapters/pdb.py`) are
+sorted by role: known **cofactors** (heme, FAD/FMN, NAD(P)(H), PLP, TPP, CoA,
+SAM/SAH, ATP/ADP/GTP/GDP, Fe–S clusters, molybdopterin, cobalamin, biotin,
+chlorophylls, …) and **catalytic metals** (Zn, Fe, Cu, Mn, Ni, Co, Mo, …)
+stay in the receptor and can define the site; **structural ions** (Ca, Mg)
+stay in the receptor but never define it; **co-crystallized ligands**
+(inhibitors, substrate analogs) define the site but are removed from the
+receptor — leave *Ligand* empty and PhiEx fetches the ligand's SMILES from
+RCSB and **re-docks it**, reporting the pose RMSD to the crystal (≤ 2 Å means
+docking reproduces the experimental binding mode). Waters, buffers,
+cryoprotectants, glycans and modified residues are ignored; MSE is read as
+Met. For AlphaFold models use the `AFILL:<UniProt>` entry — AlphaFill
+transplants cofactors and ligands from homologous structures.
+
+**Ligand screen** (stage 4b, `POST /api/dock/batch`, CSV at
+`/api/dock/batch.csv`): paste up to 50 ligands, one per line — a SMILES, a
+compound name (PubChem), or `label: SMILES-or-name`. Each is docked into the
+same site with the same settings and the table ranks them by Vina score with
+ligand efficiency (−score / heavy atoms), the site residues each pose touches,
+and distance to the site centre. Include a known substrate and a negative
+control: Vina scores carry ~±2 kcal/mol error, so trust the ranking and the
+contacts, not the absolute numbers.
+
 **How to read the discovery flags now:** they are site residues that the
 structure-based evidence (docked-pose contacts, MD contacts, mutation
 sensitivity) points to but sequence-level attention does not — candidates

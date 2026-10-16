@@ -685,6 +685,89 @@ _AA3 = {
 _COFACTORS = {"HEM": "HEME", "HEC": "HEME-C", "FAD": "FAD", "NAD": "NAD",
               "NDP": "NADPH", "FMN": "FMN"}
 
+# ── hetero-group classification ────────────────────────────────────────
+# Every HETATM group is sorted into one of four roles (metadata["role"]):
+#   cofactor  known organic prosthetic groups / coenzymes — part of the
+#             receptor, can define the active site
+#   metal     catalytic metal ions — part of the receptor, can define the site
+#   ion       structural ions (Ca, Mg) — kept in the receptor near the site,
+#             never used to define it
+#   ligand    anything else bound (substrate analog, inhibitor, product) —
+#             defines the site when present, but is REMOVED from the receptor
+#             so the user's ligand can be docked where it sat
+# Waters, buffers, cryoprotectants, precipitants and glycans are dropped.
+
+_KNOWN_COFACTORS = {
+    "HEM": "HEME", "HEC": "HEME-C", "HEA": "HEME-A", "HEB": "HEME-B",
+    "HDD": "HEME-D", "SRM": "SIROHEME", "DHE": "HEME-D1",
+    "FAD": "FAD", "FDA": "FADH2", "FMN": "FMN", "FNR": "FMNH2",
+    "NAD": "NAD", "NAI": "NADH", "NAP": "NADP", "NDP": "NADPH", "NAJ": "NAD",
+    "PLP": "PLP", "PMP": "PMP", "LLP": "PLP-Lys",
+    "TPP": "TPP", "TDP": "TDP", "COA": "CoA", "ACO": "acetyl-CoA",
+    "SAM": "SAM", "SAH": "SAH", "SFG": "sinefungin",
+    "ATP": "ATP", "ADP": "ADP", "ANP": "AMP-PNP", "ACP": "AMP-PCP", "AGS": "ATP-γS",
+    "GTP": "GTP", "GDP": "GDP", "GNP": "GMP-PNP",
+    "SF4": "[4Fe-4S]", "FES": "[2Fe-2S]", "F3S": "[3Fe-4S]",
+    "MGD": "Mo-bisMGD", "MTE": "molybdopterin", "PCD": "Mo-pterin",
+    "B12": "cobalamin", "CNC": "cyanocobalamin", "COB": "Co-methylcobalamin",
+    "BTN": "biotin", "LPA": "lipoate", "H4B": "BH4", "PQQ": "PQQ",
+    "TPQ": "TPQ", "UQ1": "ubiquinone", "U10": "ubiquinone-10", "MQ7": "menaquinone",
+    "CLA": "chlorophyll a", "CHL": "chlorophyll b", "BCL": "bacteriochlorophyll",
+    "RET": "retinal", "F42": "F420", "FMT_": "",
+}
+_KNOWN_COFACTORS.pop("FMT_")
+_CATALYTIC_METALS = {"ZN", "FE", "FE2", "CU", "CU1", "MN", "NI", "CO", "MO", "W", "V", "CD"}
+_STRUCTURAL_IONS = {"CA", "MG"}
+_DROP = {
+    # water
+    "HOH", "WAT", "DOD", "H2O",
+    # common crystallisation additives / buffers / cryoprotectants
+    "SO4", "PO4", "GOL", "EDO", "PEG", "PG4", "PGE", "1PE", "P6G", "2PE", "12P",
+    "PE4", "P33", "ACT", "ACY", "FMT", "CL", "BR", "IOD", "NA", "K", "LI", "CS",
+    "DMS", "MPD", "MRD", "TRS", "EPE", "MES", "BME", "NO3", "SCN", "CIT", "FLC",
+    "TLA", "TAR", "IMD", "NH4", "AZI", "CAC", "MLI", "SIN", "IPA", "EOH", "MOH",
+    "BU3", "PGO", "PGR", "DIO", "BTB", "HEZ", "B3P", "CXS", "MLA", "ACN", "UNX",
+    "UNL", "UNK", "OXY", "PEO",
+    # N-/O-glycans
+    "NAG", "NDG", "MAN", "BMA", "FUC", "GAL", "SIA", "FUL", "XYP",
+}
+
+
+def classify_het(resname: str, atoms) -> "tuple[str, str] | None":
+    """(display_name, role) for a hetero group, or None to drop it."""
+    rn = resname.strip().upper()
+    if rn in _DROP:
+        return None
+    names = {a.name.strip().upper() for a in atoms}
+    if {"N", "CA", "C"} <= names:
+        return None                         # modified amino acid in the chain, not a ligand
+    if rn in _KNOWN_COFACTORS:
+        return _KNOWN_COFACTORS[rn], "cofactor"
+    heavy = [a for a in atoms if a.element.upper() != "H"]
+    if len(heavy) == 1:
+        el = heavy[0].element.upper()
+        if rn in _CATALYTIC_METALS or el in _CATALYTIC_METALS:
+            return el.title() if len(el) > 1 else el, "metal"
+        if rn in _STRUCTURAL_IONS or el in _STRUCTURAL_IONS:
+            return el.title(), "ion"
+        return None                         # other single atoms: ions from buffer
+    if len(heavy) < 6:
+        return None                         # small fragments (ethanol, acetate …)
+    return rn, "ligand"
+
+
+_METALS_ANY = _CATALYTIC_METALS | _STRUCTURAL_IONS
+
+
+def _make_cofactor(resname: str, atoms, chain: str = "", resseq: int = 0):
+    cls = classify_het(resname, atoms)
+    if cls is None:
+        return None
+    name, role = cls
+    metal = next((a for a in atoms if a.element.upper() in _METALS_ANY), None)
+    return Cofactor(name=name, resname=resname, atoms=tuple(atoms), metal_atom=metal,
+                    metadata={"role": role, "chain": chain, "resseq": resseq})
+
 
 def parse_pdb_text(pdb_text: str, name: str = "") -> tuple[Protein, list[Cofactor]]:
     """Plain-text PDB parser, no Bio.PDB dependency required for v0.
@@ -716,13 +799,18 @@ def _parse_with_biopython(pdb_text: str, name: str) -> tuple[Protein, list[Cofac
             for res in chain:
                 hetflag, resseq, icode = res.id
                 resname = res.get_resname()
+                if resname == "MSE":                     # selenomethionine → Met
+                    resname, hetflag = "MET", " "
                 atoms = []
                 for a in res:
                     coord = a.get_coord()
+                    aname, el = a.get_name(), (a.element or a.get_name()[0]).strip().upper()
+                    if resname == "MET" and aname == "SE":
+                        aname, el = "SD", "S"
                     atoms.append(Atom(
                         index=atom_idx,
-                        name=a.get_name(),
-                        element=(a.element or a.get_name()[0]).strip().upper(),
+                        name=aname,
+                        element=el,
                         xyz=(float(coord[0]), float(coord[1]), float(coord[2])),
                         bfactor=float(a.get_bfactor()),
                     ))
@@ -732,15 +820,10 @@ def _parse_with_biopython(pdb_text: str, name: str) -> tuple[Protein, list[Cofac
                         index=int(resseq), name=resname, chain=chain.id,
                         atoms=tuple(atoms)))
                     seq_chars.append(_AA3[resname])
-                elif resname in _COFACTORS:
-                    metal = None
-                    for a in atoms:
-                        if a.element in ("FE", "MG", "ZN", "CU", "MN"):
-                            metal = a; break
-                    cofactors_out.append(Cofactor(
-                        name=_COFACTORS[resname], resname=resname,
-                        atoms=tuple(atoms), metal_atom=metal,
-                    ))
+                elif hetflag != " " or resname not in _AA3:
+                    cof = _make_cofactor(resname, atoms, chain.id, int(resseq))
+                    if cof is not None:
+                        cofactors_out.append(cof)
         break  # first model only
     protein = Protein(
         name=name, sequence="".join(seq_chars),
@@ -768,10 +851,16 @@ def _parse_naive(pdb_text: str, name: str) -> tuple[Protein, list[Cofactor]]:
         try:
             atom_name = line[12:16].strip()
             resname = line[17:20].strip()
+            if resname == "MSE":
+                resname, line = "MET", "ATOM  " + line[6:]
+                if atom_name == "SE":
+                    atom_name = "SD"
             chain = line[21:22].strip() or "A"
             resseq = int(line[22:26])
             x = float(line[30:38]); y = float(line[38:46]); z = float(line[46:54])
             element = line[76:78].strip() or atom_name[0]
+            if resname == "MET" and element.upper() == "SE":
+                element = "S"
             try:
                 bfac = float(line[60:66])
             except ValueError:
@@ -787,7 +876,7 @@ def _parse_naive(pdb_text: str, name: str) -> tuple[Protein, list[Cofactor]]:
             res_meta[key] = resname
             if not any(s[0] == resseq and s[1] == chain for s in seq):
                 seq.append((resseq, chain, _AA3[resname]))
-        elif line.startswith("HETATM") and resname in _COFACTORS:
+        elif line.startswith("HETATM"):
             key = (chain, resseq)
             cof_atoms.setdefault(key, []).append(a)
             cof_resname[key] = resname
@@ -800,12 +889,9 @@ def _parse_naive(pdb_text: str, name: str) -> tuple[Protein, list[Cofactor]]:
 
     cofactors_out: list[Cofactor] = []
     for k, atoms in cof_atoms.items():
-        metal = next((a for a in atoms if a.element in ("FE","MG","ZN","CU","MN")), None)
-        cofactors_out.append(Cofactor(
-            name=_COFACTORS.get(cof_resname[k], cof_resname[k]),
-            resname=cof_resname[k],
-            atoms=tuple(atoms), metal_atom=metal,
-        ))
+        cof = _make_cofactor(cof_resname[k], atoms, k[0], k[1])
+        if cof is not None:
+            cofactors_out.append(cof)
     return Protein(name=name, sequence=seq_chars, residues=residues_out,
                    source="pdb", pdb_text=pdb_text), cofactors_out
 
@@ -858,7 +944,10 @@ def fetch_protein(pdb_id: str = APX_DEFAULT_PDB,
                    f"check network / verify the AlphaFold model exists for this accession")
         return Protein(name=pdb_id, sequence="", source="unavailable"), [], annotations
     protein, cofactors = parse_pdb_text(pdb_text, name=pdb_id)
-    log("phi", f"parsed {pdb_id}: {protein.n_residues} residues, "
-                f"{len(cofactors)} cofactor(s) "
-                f"({', '.join(c.name for c in cofactors) or 'none'})")
+    by_role: dict = {}
+    for c in cofactors:
+        by_role.setdefault(c.metadata.get("role", "cofactor"), []).append(c.name)
+    summary = "; ".join(f"{role}: {', '.join(sorted(set(n)))} (×{len(n)})"
+                        for role, n in by_role.items()) or "no hetero groups"
+    log("phi", f"parsed {pdb_id}: {protein.n_residues} residues — {summary}")
     return protein, cofactors, annotations

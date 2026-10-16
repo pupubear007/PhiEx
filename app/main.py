@@ -232,6 +232,7 @@ def api_structure(req: StructureRequest):
     out["residue_labels"] = {r.index: f"{r.name.title()}{r.index}"
                              for r in working_chain(working)[0]}
     out["cofactors"] = [{"name": c.name, "resname": c.resname,
+                         "role": c.metadata.get("role", "cofactor"),
                          "metal": list(c.metal_atom.xyz) if c.metal_atom else None,
                          "stub": bool(c.metadata.get("stub", False))}
                         for c in cofactors]
@@ -344,6 +345,44 @@ def api_dock(req: DockRequest):
             "n_poses": len(poses),
             "pose_contacts": contacts,
             "poses": [_pose_json(p) for p in poses]}
+
+
+class ScreenRequest(BaseModel):
+    ligands: str                  # one per line: SMILES, name, or "label: SMILES-or-name"
+    exhaustiveness: int = 8
+
+
+@app.post("/api/dock/batch")
+def api_dock_batch(req: ScreenRequest):
+    """Dock a list of ligands into the current site and rank them."""
+    from PhiEx.pipeline.screen import parse_ligand_list, screen_ligands
+    protein: Protein = SESSION.get("protein")
+    pockets: list[Pocket] = SESSION.get("pockets") or []
+    site = SESSION.get("site")
+    if not protein or not pockets:
+        return JSONResponse({"error": "run stages 1 and 3 (structure, site) first"},
+                            status_code=400)
+    pocket = next((p for p in pockets if p.is_active_site), pockets[0])
+    state = ComplexState(protein=protein, cofactors=tuple(SESSION.get("cofactors") or []),
+                         metadata={"site_center": site.center} if site else {})
+    try:
+        out = screen_ligands(state, pocket, site, parse_ligand_list(req.ligands),
+                             exhaustiveness=max(1, min(32, req.exhaustiveness)))
+    except (ValueError, RuntimeError) as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    SESSION["screen"] = out
+    return out
+
+
+@app.get("/api/dock/batch.csv")
+def api_dock_batch_csv():
+    from PhiEx.pipeline.screen import rows_to_csv
+    from fastapi.responses import Response
+    out = SESSION.get("screen")
+    if not out:
+        return JSONResponse({"error": "no screen run yet"}, status_code=404)
+    return Response(rows_to_csv(out["rows"]), media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=phiex_ligand_screen.csv"})
 
 
 class DynamicsRequest(BaseModel):
@@ -556,6 +595,7 @@ def _pose_json(p) -> dict:
     return {
         "pose_id": p.pose_id, "score": p.score,
         "stub": bool(p.ligand.metadata.get("stub")),
+        "crystal_rmsd": p.ligand.metadata.get("crystal_rmsd"),
         "score_uncertainty": p.score_uncertainty,
         "rmsd_to_best": p.rmsd_to_best,
         "ligand": {"name": p.ligand.name, "smiles": p.ligand.smiles,

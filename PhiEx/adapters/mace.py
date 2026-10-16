@@ -70,6 +70,8 @@ def select_active_site_region(state: ComplexState,
             if _ok(a):
                 region.append(a)
     for c in state.cofactors:
+        if c.metadata.get("role") == "ligand":
+            continue                       # replaced by the docked ligand
         if center is not None and c.atoms and \
                 min(math.dist(a.xyz, center) for a in c.atoms) > 6.0:
             continue

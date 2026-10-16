@@ -364,6 +364,7 @@ def _pose_to_json(p) -> dict:
     return {
         "pose_id": p.pose_id, "score": p.score,
         "stub": bool(p.ligand.metadata.get("stub")),
+        "crystal_rmsd": p.ligand.metadata.get("crystal_rmsd"),
         "score_uncertainty": p.score_uncertainty,
         "rmsd_to_best": p.rmsd_to_best,
         "ligand": {"name": p.ligand.name, "smiles": p.ligand.smiles,

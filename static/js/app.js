@@ -294,7 +294,7 @@ $("#run-structure").addEventListener("click", async () => {
       $("#v-rmsd").textContent = r.rmsd_pred_vs_exp.toFixed(2);
     $("#state-readout").innerHTML =
       `protein: <b>${r.experimental.name||"—"}</b><br>` +
-      `cofactors: <b>${r.cofactors.map(c=>c.name).join(", ")||"—"}</b><br>` +
+      `hetero groups: <b>${summarizeHet(r.cofactors)}</b><br>` +
       `active site: <b>—</b>`;
     residueLabels = r.residue_labels || {};
   } catch(e){ alert("structure: "+e.message); }
@@ -340,6 +340,46 @@ $("#run-dock").addEventListener("click", async () => {
       ((r.pose_contacts||[]).length ? `<br>contacts: ${r.pose_contacts.map(pill).join("")}` : "");
   } catch(e){ alert("dock: "+e.message); }
 });
+
+$("#run-screen").addEventListener("click", async () => {
+  const text = $("#i-ligands").value.trim();
+  if (!text) { alert("screen: paste one ligand per line first"); return; }
+  const n = text.split(/[\n;]+/).filter(s => s.trim() && !s.trim().startsWith("#")).length;
+  $("#screen-readout").innerHTML = `docking ${n} ligand(s)… progress in the ticker`;
+  try {
+    const r = await postJSON("/api/dock/batch", {ligands: text});
+    renderScreen(r);
+  } catch(e){
+    $("#screen-readout").innerHTML = `<span style="color:var(--warn, #c66)">screen failed — ${e.message}</span>`;
+  }
+});
+
+function summarizeHet(list){
+  if (!list || !list.length) return "—";
+  const n = {};
+  list.forEach(c => { const k = `${c.name}${c.role && c.role !== "cofactor" ? " (" + c.role + ")" : ""}`; n[k] = (n[k]||0) + 1; });
+  return Object.entries(n).map(([k, v]) => v > 1 ? `${k} ×${v}` : k).join(", ");
+}
+
+function renderScreen(r){
+  const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+  const showRmsd = r.rows.some(x => x.crystal_rmsd != null);
+  const head = `<tr><th>#</th><th>ligand</th><th>score</th><th>LE</th><th>site hits</th><th>dist</th>${showRmsd ? "<th>RMSD</th>" : ""}</tr>`;
+  const body = r.rows.map(x => x.error
+    ? `<tr class="err"><td>—</td><td title="${esc(x.input)}">${esc(x.name)}</td><td colspan="${showRmsd ? 5 : 4}" title="${esc(x.error)}">${esc(x.error.split(" — ")[0])}</td></tr>`
+    : `<tr><td>${x.rank}</td><td title="${esc(x.smiles)}">${esc(x.name)}</td>` +
+      `<td class="num">${x.score.toFixed(2)}</td><td class="num">${x.efficiency != null ? x.efficiency.toFixed(2) : "—"}</td>` +
+      `<td>${(x.site_hits||[]).map(n => resLabel(n)).join(" ") || "<span style='color:var(--warn, #c66)'>none</span>"}</td>` +
+      `<td class="num">${x.dist_to_site != null ? x.dist_to_site.toFixed(1) : "—"}</td>` +
+      (showRmsd ? `<td class="num">${x.crystal_rmsd != null ? x.crystal_rmsd.toFixed(2) : "—"}</td>` : "") + `</tr>`
+  ).join("");
+  $("#screen-readout").innerHTML =
+    `<div style="margin-bottom:4px">${r.n_ok} docked · ${r.n_failed} failed · ${r.seconds}s · site <b>${esc((r.site||{}).label || r.pocket_id)}</b></div>` +
+    `<table class="screen-table">${head}${body}</table>` +
+    `<div style="color:var(--ink-dim);font-size:10px;margin-top:4px">score: Vina kcal/mol (±~2; rank, don't trust absolutes) · LE: −score/heavy atom (≥0.3 good) · ` +
+    `site hits: defining site residues within 4 Å · dist: closest atom to site centre, Å</div>` +
+    `<a href="/api/dock/batch.csv" download style="font-size:11px">⤓ download CSV</a>`;
+}
 
 $("#run-dynamics").addEventListener("click", async () => {
   try {
@@ -453,7 +493,7 @@ async function resetAll(){
 
   // 4. side-panel readouts — restore initial empty messages
   $("#phi0-readout").innerHTML       = "no annotations yet — run stage 2";
-  $("#state-readout").innerHTML      = "protein: <b>—</b><br>cofactors: <b>—</b><br>active site: <b>—</b>";
+  $("#state-readout").innerHTML      = "protein: <b>—</b><br>hetero groups: <b>—</b><br>active site: <b>—</b>";
   $("#theories-readout").innerHTML   = "none loaded";
   $("#pockets-readout").innerHTML    = "no pockets yet";
   $("#poses-readout").innerHTML      = "no poses yet";
@@ -462,6 +502,7 @@ async function resetAll(){
                                         "residence near site: <b id=\"v-res\">—</b> ps";
   $("#al-readout").innerHTML         = "no iterations yet";
   $("#cross-readout").innerHTML      = "run AL first to populate";
+  $("#screen-readout").innerHTML     = "paste ligands under stage 4 and press 4b";
   $("#struct-readout").innerHTML     = "mean pLDDT: <b id=\"v-plddt\">—</b><br>" +
                                         "Cα RMSD vs experimental: <b id=\"v-rmsd\">—</b> Å<br>" +
                                         "ESM-2 embed σ: <b id=\"v-emb\">—</b>";

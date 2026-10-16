@@ -615,3 +615,97 @@ def test_dock_route_rejects_unparseable_ligand(monkeypatch):
         for k in ("protein", "pockets", "site"):
             main.SESSION.pop(k, None)
     assert r.status_code == 400 and "not a valid SMILES" in r.json()["error"]
+
+
+# ────────────────────────────────────────────────────────────────────────
+# hetero-group roles
+# ────────────────────────────────────────────────────────────────────────
+
+def test_hetero_groups_are_classified_by_role():
+    from PhiEx.adapters.pdb import classify_het
+    one = lambda el: [Atom(0, el, el, (0, 0, 0))]
+    many = lambda n: [Atom(i, f"C{i}", "C", (i, 0, 0)) for i in range(n)]
+    assert classify_het("HEM", many(43)) == ("HEME", "cofactor")
+    assert classify_het("PLP", many(15)) == ("PLP", "cofactor")
+    assert classify_het("ZN", one("ZN")) == ("Zn", "metal")
+    assert classify_het("CA", one("CA")) == ("Ca", "ion")
+    assert classify_het("NA", one("NA")) is None              # buffer ion
+    assert classify_het("GOL", many(6)) is None                # cryoprotectant
+    assert classify_het("NAG", many(14)) is None               # glycan
+    assert classify_het("STI", many(37)) == ("STI", "ligand")  # inhibitor
+    modified = [Atom(0, "N", "N", (0, 0, 0)), Atom(1, "CA", "C", (1, 0, 0)),
+                Atom(2, "C", "C", (2, 0, 0))] + many(5)
+    assert classify_het("CAS", modified) is None               # modified residue
+
+
+def test_selenomethionine_reads_as_methionine():
+    from PhiEx.adapters.pdb import parse_pdb_text
+    mse = ("HETATM    1  N   MSE A   1       0.000   0.000   0.000  1.00  0.00           N\n"
+           "HETATM    2  CA  MSE A   1       1.000   0.000   0.000  1.00  0.00           C\n"
+           "HETATM    3 SE   MSE A   1       2.000   0.000   0.000  1.00  0.00          SE\n")
+    p, cof = parse_pdb_text(mse, "x")
+    assert [r.name for r in p.residues] == ["MET"] and cof == []
+    assert ("SD", "S") in [(a.name, a.element) for a in p.residues[0].atoms]
+
+
+def test_site_priority_cofactor_then_ligand_then_metal_never_ion():
+    from PhiEx.analysis.site import resolve_active_site
+    p = _triad_protein()
+    def cof(name, role, xyz, n=1):
+        atoms = tuple(Atom(i, f"X{i}", "C" if n > 1 else name.upper(), (xyz[0] + i, xyz[1], xyz[2]))
+                      for i in range(n))
+        metal = atoms[0] if role in ("metal", "ion") else None
+        return Cofactor(name=name, resname=name.upper()[:3], atoms=atoms, metal_atom=metal,
+                        metadata={"role": role})
+    ca = cof("Ca", "ion", (5, 0, 0)); zn = cof("Zn", "metal", (6, 0, 0))
+    lig = cof("STI", "ligand", (7, 0, 0), n=8); fad = cof("FAD", "cofactor", (8, 0, 0), n=10)
+    assert resolve_active_site(p, [ca]).source == "catalytic-triad"     # Ca never defines it
+    assert resolve_active_site(p, [ca, zn]).label == "Zn ion"
+    s = resolve_active_site(p, [ca, zn, lig])
+    assert s.source == "bound-ligand" and s.bound_ligand == "STI" and len(s.bound_ligand_xyz) == 8
+    assert resolve_active_site(p, [ca, zn, lig, fad]).cofactor == "FAD"
+
+
+def test_crystal_pose_rmsd_matches_atoms_by_element():
+    from PhiEx.adapters.vina import crystal_pose_rmsd
+    ref = [("C", (0.0, 0, 0)), ("O", (1.2, 0, 0)), ("C", (2.4, 0, 0))]
+    shuffled = [Atom(0, "C2", "C", (2.4, 0, 0)), Atom(1, "C1", "C", (0.0, 0, 0)),
+                Atom(2, "O1", "O", (1.2, 0, 0))]
+    assert crystal_pose_rmsd(shuffled, ref) == pytest.approx(0.0)
+
+
+# ────────────────────────────────────────────────────────────────────────
+# ligand screen
+# ────────────────────────────────────────────────────────────────────────
+
+def test_parse_ligand_list_formats():
+    from PhiEx.pipeline.screen import parse_ligand_list
+    got = parse_ligand_list("CCO\n# comment\n\ntributyrin; C8: CCCCCCCC(=O)O\n[CH3:1]O")
+    assert got == [("", "CCO"), ("", "tributyrin"), ("C8", "CCCCCCCC(=O)O"), ("", "[CH3:1]O")]
+
+
+def test_screen_ranks_and_reports_failures(monkeypatch):
+    from PhiEx.pipeline import screen as S
+    from PhiEx.core.state import DockingPose
+    from PhiEx.analysis.site import resolve_active_site
+    p = _triad_protein()
+    site = resolve_active_site(p, [])
+    scores = {"CCO": -3.0, "CCCCO": -5.0}
+
+    class FakeVina:
+        is_stub = False; backend = "fake"
+        def __init__(self, **k): pass
+        def dock(self, state, lig, pocket):
+            atoms = (Atom(0, "C1", "C", site.center),)
+            return [DockingPose(ligand=Ligand(name=lig.name, smiles=lig.smiles, atoms=atoms),
+                                score=scores[lig.smiles], score_uncertainty=0.0, pose_id=0)]
+    monkeypatch.setattr(S, "VinaAdapter", FakeVina)
+    monkeypatch.setattr("PhiEx.adapters.vina._pubchem_smiles", lambda n: None)
+    out = S.screen_ligands(ComplexState(protein=p), Pocket(id="SITE", center=site.center, score=0),
+                           site, [("", "CCO"), ("butanol", "CCCCO"), ("", "notamolecule")])
+    ok = [r for r in out["rows"] if not r["error"]]
+    assert [r["name"] for r in ok] == ["butanol", "CCO"] and ok[0]["rank"] == 1
+    assert ok[0]["site_hits"] == [12, 40] and ok[0]["efficiency"] == pytest.approx(1.0)
+    assert out["n_failed"] == 1 and "not a valid SMILES" in out["rows"][-1]["error"]
+    csv = S.rows_to_csv(out["rows"])
+    assert csv.splitlines()[0].startswith("rank,name,score") and "butanol" in csv

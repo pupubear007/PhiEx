@@ -55,12 +55,15 @@ class ActiveSite:
     chain: Optional[str] = None
     notes: list = field(default_factory=list)
     cofactor: Optional[str] = None   # e.g. "HEME" when the site is a cofactor
+    bound_ligand: Optional[str] = None             # co-crystallized ligand resname
+    bound_ligand_xyz: tuple = ()                   # its heavy atoms: (element, xyz)
 
     def to_json(self) -> dict:
         return {"center": [round(c, 3) for c in self.center], "source": self.source,
                 "label": self.label, "confidence": self.confidence, "kind": self.kind,
                 "residues": list(self.residues), "chain": self.chain,
-                "notes": list(self.notes), "cofactor": self.cofactor}
+                "notes": list(self.notes), "cofactor": self.cofactor,
+                "bound_ligand": self.bound_ligand}
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -197,9 +200,12 @@ def _classify_anchor(found: list, center, cofactors: list) -> "tuple[str, Option
                 return ("serine-hydrolase" if nuc.name == "SER"
                         else "cysteine-hydrolase"), None
     for c in cofactors:
-        if c.metadata.get("stub") or not c.atoms:
+        role = c.metadata.get("role", "cofactor")
+        if c.metadata.get("stub") or not c.atoms or role == "ion":
             continue
         if min(_dist(a.xyz, center) for a in c.atoms) <= 6.0:
+            if role == "ligand":
+                return "ligand-site", None
             return ("metal-cofactor" if c.metal_atom else "cofactor"), c.name
     return "unknown", None
 
@@ -208,22 +214,43 @@ def _classify_anchor(found: list, center, cofactors: list) -> "tuple[str, Option
 # 2. real cofactor
 # ────────────────────────────────────────────────────────────────────────
 
+_SITE_ROLES = ("cofactor", "ligand", "metal")   # priority order; "ion" never defines a site
+
+
 def site_from_cofactors(protein: Protein, cofactors: list[Cofactor]) -> Optional[ActiveSite]:
-    real = [c for c in cofactors if not c.metadata.get("stub") and c.atoms]
+    """Organic cofactor > co-crystallized ligand > catalytic metal.
+    Structural ions (Ca, Mg) never define the site.  Among copies (homo-
+    oligomers repeat them) the one bound to the first chain wins."""
+    real = [c for c in cofactors if not c.metadata.get("stub") and c.atoms
+            and c.metadata.get("role", "cofactor") in _SITE_ROLES]
     if not real:
         return None
     chain = first_chain(protein)
+    own = chain_residues(protein, chain)
 
-    def _key(c: Cofactor) -> float:
-        # prefer the copy bound to the first chain (homo-oligomers repeat it)
+    def _key(c: Cofactor):
         p = c.metal_atom.xyz if c.metal_atom else _mean(a.xyz for a in c.atoms)
-        own = chain_residues(protein, chain)
-        return min((_dist(p, a.xyz) for r in own for a in r.atoms), default=1e9)
+        d = min((_dist(p, a.xyz) for r in own for a in r.atoms), default=1e9)
+        return (_SITE_ROLES.index(c.metadata.get("role", "cofactor")), d > 6.0, d)
 
     c = sorted(real, key=_key)[0]
-    if c.metal_atom is not None:
+    role = c.metadata.get("role", "cofactor")
+    if role == "ligand":
+        center = _mean(a.xyz for a in c.atoms if a.element.upper() != "H")
+        return ActiveSite(center=center, source="bound-ligand",
+                          label=f"co-crystallized {c.resname}", confidence="high",
+                          kind="ligand-site", chain=chain, cofactor=None,
+                          bound_ligand=c.resname,
+                          bound_ligand_xyz=tuple((a.element.upper(), a.xyz) for a in c.atoms
+                                                 if a.element.upper() != "H"),
+                          residues=residues_near(protein, center, 4.5, chain),
+                          notes=[f"{c.resname} is removed from the receptor so ligands "
+                                 f"can be docked where it sat; leave Ligand empty to "
+                                 f"re-dock it (pose RMSD validates the docking)"])
+    if c.metal_atom is not None and (role == "metal" or len(c.atoms) > 1):
         center, kind = c.metal_atom.xyz, "metal-cofactor"
-        label = f"{c.name} {c.metal_atom.element.title()}"
+        label = (f"{c.name} {c.metal_atom.element.title()}" if len(c.atoms) > 1
+                 else f"{c.name} ion")
     else:
         center, kind = _mean(a.xyz for a in c.atoms), "cofactor"
         label = f"{c.name} centroid"
