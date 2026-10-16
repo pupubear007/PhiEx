@@ -820,9 +820,11 @@ function renderResult(r){
     `<div>${p.is_active_site?'<span style="color:var(--accent)">★ </span>':''}<b>${p.id}</b> score ${p.score.toFixed(2)} · ${p.nearby_residues.length} residues</div>`
   ).join("") || "no pockets";
   drawPoses(r.poses || []);
-  $("#poses-readout").innerHTML =
-    `<b>${(r.ligand||{}).name || "ligand"}</b>: <b>${(r.poses||[]).length}</b> poses · best <b>${(r.poses[0]||{}).score?.toFixed(2)}</b> kcal/mol` +
-    ((r.pose_contacts||[]).length ? `<br>contacts: ${r.pose_contacts.map(pill).join("")}` : "");
+  $("#poses-readout").innerHTML = (r.poses||[]).length
+    ? `<b>${(r.ligand||{}).name || "ligand"}</b>${(r.ligand||{}).default ? ' <span style="color:var(--ink-dim)">(default for this site)</span>' : ""}: ` +
+      `<b>${r.poses.length}</b> poses · best <b>${r.poses[0].score.toFixed(2)}</b> kcal/mol` +
+      ((r.pose_contacts||[]).length ? `<br>contacts: ${r.pose_contacts.map(pill).join("")}` : "")
+    : `no ligand docked — no default substrate for this site type; enter a SMILES in <b>Ligand SMILES</b>`;
 
   // dynamics
   drawEnergies(r.energies_ev);

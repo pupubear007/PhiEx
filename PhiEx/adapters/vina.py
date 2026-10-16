@@ -164,14 +164,19 @@ PNP_ACETATE = Ligand(
 )
 
 
-def default_ligand_for_site(site) -> Ligand:
-    """Sensible default when the user gives no SMILES.  Heme peroxidases
-    keep ascorbate (the APX example); hydrolase sites get p-nitrophenyl
-    acetate; anything else gets ascorbate with a note to supply a SMILES."""
+def default_ligand_for_site(site) -> "Ligand | None":
+    """Default substrate when the user gives no SMILES — only where the
+    site itself says what a reasonable probe is:
+        serine/cysteine hydrolase → p-nitrophenyl acetate (esterase assay)
+        heme site                 → ascorbate (the APX reducing substrate)
+    Anything else returns None: docking an arbitrary molecule into an
+    unknown site produces numbers that look meaningful and are not."""
     kind = getattr(site, "kind", "") or ""
     if kind in ("serine-hydrolase", "cysteine-hydrolase"):
         return PNP_ACETATE
-    return ASCORBATE
+    if (getattr(site, "cofactor", "") or "").upper().startswith("HEME"):
+        return ASCORBATE
+    return None
 
 
 # ────────────────────────────────────────────────────────────────────────

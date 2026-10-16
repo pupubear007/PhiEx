@@ -54,12 +54,13 @@ class ActiveSite:
     residues: tuple[int, ...] = ()   # defining residues (resseq)
     chain: Optional[str] = None
     notes: list = field(default_factory=list)
+    cofactor: Optional[str] = None   # e.g. "HEME" when the site is a cofactor
 
     def to_json(self) -> dict:
         return {"center": [round(c, 3) for c in self.center], "source": self.source,
                 "label": self.label, "confidence": self.confidence, "kind": self.kind,
                 "residues": list(self.residues), "chain": self.chain,
-                "notes": list(self.notes)}
+                "notes": list(self.notes), "cofactor": self.cofactor}
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -151,7 +152,8 @@ def parse_anchor(spec: str) -> list[tuple[Optional[str], Optional[str], int]]:
     return out
 
 
-def site_from_anchor(protein: Protein, spec: str) -> ActiveSite:
+def site_from_anchor(protein: Protein, spec: str,
+                     cofactors: Optional[list] = None) -> ActiveSite:
     wanted = parse_anchor(spec)
     default_chain = first_chain(protein)
     found: list[Residue] = []
@@ -169,10 +171,37 @@ def site_from_anchor(protein: Protein, spec: str) -> ActiveSite:
             found.append(r)
     center = _mean(functional_point(r) for r in found)
     label = "anchor " + "–".join(residue_label(r) for r in found)
+    kind, cof_name = _classify_anchor(found, center, cofactors or [])
+    if kind != "unknown":
+        notes.append(f"anchor residues look like a {kind} site"
+                     + (f" ({cof_name})" if cof_name else ""))
     return ActiveSite(center=center, source="anchor", label=label,
-                      confidence="user", kind="unknown",
+                      confidence="user", kind=kind,
                       residues=tuple(r.index for r in found),
-                      chain=found[0].chain, notes=notes)
+                      chain=found[0].chain, notes=notes, cofactor=cof_name)
+
+
+def _classify_anchor(found: list, center, cofactors: list) -> "tuple[str, Optional[str]]":
+    """What kind of site did the user point at?  A Ser/Cys hydrogen-bonded
+    to a His among the anchor residues → hydrolase; a real cofactor within
+    6 Å of the anchor centre → that cofactor's site; otherwise unknown."""
+    hiss = [r for r in found if r.name == "HIS"]
+    for nuc in (r for r in found if r.name in ("SER", "CYS")):
+        nu = _atom(nuc, "OG", "SG")
+        if nu is None:
+            continue
+        cutoff = _HB_MAX + (0.4 if nuc.name == "CYS" else 0.0)
+        for his in hiss:
+            if any(a.name in ("NE2", "ND1") and _dist(a.xyz, nu.xyz) <= cutoff
+                   for a in his.atoms):
+                return ("serine-hydrolase" if nuc.name == "SER"
+                        else "cysteine-hydrolase"), None
+    for c in cofactors:
+        if c.metadata.get("stub") or not c.atoms:
+            continue
+        if min(_dist(a.xyz, center) for a in c.atoms) <= 6.0:
+            return ("metal-cofactor" if c.metal_atom else "cofactor"), c.name
+    return "unknown", None
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -201,7 +230,7 @@ def site_from_cofactors(protein: Protein, cofactors: list[Cofactor]) -> Optional
     return ActiveSite(center=center, source="cofactor", label=label,
                       confidence="high", kind=kind,
                       residues=residues_near(protein, center, 4.5, chain),
-                      chain=chain)
+                      chain=chain, cofactor=c.name)
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -338,7 +367,7 @@ def resolve_active_site(protein: Protein, cofactors: list[Cofactor],
                         anchor: Optional[str] = None) -> Optional[ActiveSite]:
     """Steps 1–3.  Returns None when only a pocket can decide (step 4)."""
     if anchor:
-        return site_from_anchor(protein, anchor)
+        return site_from_anchor(protein, anchor, cofactors)
     return site_from_cofactors(protein, cofactors) or site_from_catalytic(protein)
 
 

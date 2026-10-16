@@ -315,6 +315,11 @@ def api_dock(req: DockRequest):
 
     site = SESSION.get("site")
     ligand = pick_ligand(site, req.smiles, req.ligand_name)
+    if ligand is None:
+        kind = site.kind if site else "unknown"
+        return JSONResponse({"error": f"no ligand given and no default substrate for a "
+                                      f"{kind} site — enter a SMILES in 'Ligand SMILES'"},
+                            status_code=400)
     state = ComplexState(protein=protein, cofactors=tuple(cofactors), ligands=(ligand,),
                          metadata={"site_center": site.center} if site else {})
 

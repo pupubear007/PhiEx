@@ -198,9 +198,11 @@ class APXPipeline:
             poses = []
         else:
             ligand = pick_ligand(site, self.ligand_smiles, self.ligand_name)
-            result.ligand = {"name": ligand.name, "smiles": ligand.smiles,
-                             "default": not self.ligand_smiles}
-            if self.use_diffdock:
+            result.ligand = ({"name": ligand.name, "smiles": ligand.smiles,
+                              "default": not self.ligand_smiles} if ligand else {})
+            if ligand is None:
+                poses = []
+            elif self.use_diffdock:
                 dd = DiffDockAdapter()
                 THEORIES.register(dd)
                 poses = dd.predict(state, ligand, active).value
@@ -413,12 +415,20 @@ def log_site(site: ActiveSite, pocket) -> None:
         log("sys", f"site note: {n}")
 
 
-def pick_ligand(site: Optional[ActiveSite], smiles: Optional[str], name: str = "") -> Ligand:
+def pick_ligand(site: Optional[ActiveSite], smiles: Optional[str],
+                name: str = "") -> Optional[Ligand]:
+    """The user's SMILES if given; else a default only when the site type
+    implies one; else None (caller skips docking and says why)."""
     if smiles:
-        return Ligand(name=name or "ligand", smiles=smiles)
+        return Ligand(name=name or "custom ligand", smiles=smiles)
     lig = default_ligand_for_site(site)
-    log("sys", f"no ligand SMILES given — using default for a "
-               f"{getattr(site, 'kind', 'unknown')} site: {lig.name}")
+    kind = getattr(site, "kind", "unknown")
+    if lig is None:
+        log("sys", f"no ligand SMILES given and no default substrate for a {kind} "
+                   f"site — docking skipped. Enter a SMILES in 'Ligand SMILES' to dock.")
+    else:
+        log("sys", f"no ligand SMILES given — default for a {kind} site: {lig.name} "
+                   f"(enter a SMILES to dock your own ligand)")
     return lig
 
 

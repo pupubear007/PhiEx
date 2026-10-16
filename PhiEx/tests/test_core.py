@@ -540,3 +540,37 @@ def test_vina_pose_parser_keeps_heavy_atoms():
            "ENDMDL\n")
     models = _split_pdbqt_models(txt)
     assert len(models) == 1 and [a[1] for a in models[0]] == ["C", "O"]
+
+
+def test_anchor_site_type_drives_default_ligand():
+    from PhiEx.analysis.site import resolve_active_site
+    from PhiEx.adapters.vina import default_ligand_for_site, PNP_ACETATE, ASCORBATE
+    p = _triad_protein()
+    # Ser12 hydrogen-bonded to His40 among the anchors → hydrolase → pNP-acetate
+    s = resolve_active_site(p, [], anchor="S12,H40")
+    assert s.kind == "serine-hydrolase" and default_ligand_for_site(s) is PNP_ACETATE
+    # an anchor with no catalytic chemistry and no cofactor → no default at all
+    s = resolve_active_site(p, [], anchor="G10")
+    assert s.kind == "unknown" and default_ligand_for_site(s) is None
+    # anchor next to a real heme → heme site → ascorbate
+    fe = Atom(0, "FE", "FE", (38.0, 0, 0))
+    heme = Cofactor(name="HEME", resname="HEM", atoms=(fe,), metal_atom=fe)
+    s = resolve_active_site(p, [heme], anchor="G10")
+    assert s.cofactor == "HEME" and default_ligand_for_site(s) is ASCORBATE
+
+
+def test_dock_route_refuses_to_guess_a_ligand():
+    from fastapi.testclient import TestClient
+    import app.main as main
+    from PhiEx.analysis.site import ActiveSite
+    main.SESSION["protein"] = _triad_protein()
+    main.SESSION["pockets"] = [Pocket(id="P1", center=(0, 0, 0), score=1.0, is_active_site=True)]
+    main.SESSION["site"] = ActiveSite(center=(0, 0, 0), source="pocket", label="top pocket P1",
+                                      confidence="low", kind="pocket")
+    try:
+        with TestClient(main.app, raise_server_exceptions=False) as c:
+            r = c.post("/api/dock", json={"method": "vina"})
+    finally:
+        for k in ("protein", "pockets", "site"):
+            main.SESSION.pop(k, None)
+    assert r.status_code == 400 and "SMILES" in r.json()["error"]
