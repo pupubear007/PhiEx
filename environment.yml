@@ -21,8 +21,8 @@
 #   • Heavy ML weights (ESMFold, ESM-2, MACE-OFF23) are NOT in this file.
 #     They're downloaded on first run into ./models/ — see `make weights`.
 #
-# OPTIONAL system tools (not on osx-arm64 conda channels — install manually
-# only if you want the *real* pipeline rather than the stub):
+# OPTIONAL system tools — easiest:  conda activate PhiEx && make tools
+# (scripts/install_tools.sh; manual equivalents below):
 #
 #   p2rank (Java pocket finder) — adapter falls back to a geometric stub if
 #                                  not on PATH.  To install the real thing:

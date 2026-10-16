@@ -227,6 +227,12 @@ def api_structure(req: StructureRequest):
     # one-shot pipeline operate on the same working structure
     working, cofactors = resolve_working_structure(protein, cofactors, predicted)
     SESSION["protein"] = working
+    acc = (req.uniprot or "").strip()
+    if ":" in req.pdb_id and req.pdb_id.split(":", 1)[0].upper() in ("AF", "AFILL", "SWISS"):
+        acc = req.pdb_id.split(":", 1)[1]
+    SESSION["uniprot"] = acc
+    for k in ("site", "pockets", "active_pocket", "pose_contacts", "esm2_pred", "best_pose"):
+        SESSION.pop(k, None)              # stale per-structure state
     SESSION["cofactors"] = cofactors
     out["working_source"] = working.source
     out["residue_labels"] = {r.index: f"{r.name.title()}{r.index}"
@@ -285,6 +291,7 @@ def api_pockets(req: PocketsRequest | None = None):
                                                  real_detector=not p2.is_stub)
     log_site(site, active)
     SESSION["pockets"] = pockets
+    SESSION["active_pocket"] = active
     SESSION["site"] = site
     return {
         "pockets": [_pocket_json(p) for p in pockets],
@@ -474,6 +481,39 @@ def api_candidates_local_file(name: str):
     if not p.exists() or p.suffix not in (".tsv", ".csv"):
         return JSONResponse({"error": "not found"}, status_code=404)
     return PlainTextResponse(p.read_text())
+
+
+# ────────────────────────────────────────────────────────────────────────
+# sequence viewer (AlphaFold-DB-style sequence strip + feature tracks + PAE)
+# ────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/sequence-track")
+def api_sequence_track():
+    from PhiEx.analysis.seqtrack import build_track
+    from PhiEx.analysis.site import detect_catalytic_sites
+    protein: Protein = SESSION.get("protein")
+    if not protein or not protein.residues:
+        return JSONResponse({"error": "load a structure first (stage 1)"}, status_code=400)
+    try:
+        hits = detect_catalytic_sites(protein)
+    except Exception:
+        hits = []
+    return build_track(protein, SESSION.get("uniprot") or None, SESSION.get("site"),
+                       SESSION.get("active_pocket"), SESSION.get("esm2_pred"),
+                       SESSION.get("pose_contacts"), hits)
+
+
+@app.get("/api/pae")
+def api_pae():
+    from PhiEx.analysis.seqtrack import fetch_pae
+    protein: Protein = SESSION.get("protein")
+    acc = SESSION.get("uniprot")
+    if not protein or not (protein.name or "").upper().startswith(("AF:", "AFILL:")):
+        return JSONResponse({"error": "PAE exists only for AlphaFold / AlphaFill models"}, status_code=404)
+    pae = fetch_pae(acc)
+    if pae is None:
+        return JSONResponse({"error": f"no PAE available for {acc}"}, status_code=404)
+    return pae
 
 
 class DynamicsRequest(BaseModel):

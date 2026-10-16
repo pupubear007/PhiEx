@@ -824,3 +824,40 @@ def test_unsuited_genes_are_not_docked(monkeypatch):
     enz = triage_one(Candidate(gene_id="SS1G_00003", description="Alpha/beta hydrolase fold-3"), dock=False)
     assert [r["gene_id"] for r in sort_rows([tf, enz])] == ["SS1G_00003", "Glyma.01G000200"]
     assert rows_to_csv([enz]).splitlines()[0].startswith("gene_id,organism,class_title")
+
+
+# ── sequence viewer tracks ──────────────────────────────────────────────
+
+def test_uniprot_to_residue_map_identity_and_offset():
+    from PhiEx.analysis.seqtrack import uniprot_to_residue_map
+    seq = "MKTAYIAKQRQISFVKSHFSRQ"
+    assert uniprot_to_residue_map(seq, seq, list(range(1, 23)))[5] == 5
+    # structure starts at UniProt residue 6, numbered from 101
+    m = uniprot_to_residue_map(seq, seq[5:], list(range(101, 118)))
+    assert m[6] == 101 and m[22] == 117 and 1 not in m
+
+
+def test_downsample_pae_block_max():
+    from PhiEx.analysis.seqtrack import downsample_pae
+    mat = [[float(i == j) * 0 + (i + j) for j in range(10)] for i in range(10)]
+    out = downsample_pae([{"predicted_aligned_error": mat, "max_predicted_aligned_error": 31.75}], 4)
+    assert out["n"] == 10 and out["bin"] == 3 and len(out["matrix"]) == 4
+    assert out["matrix"][0][0] == 4.0          # max over rows 0-2 × cols 0-2
+    assert out["max"] == 31.75
+
+
+def test_build_track_af_model(monkeypatch):
+    from pathlib import Path
+    from PhiEx.adapters import pdb as pdbmod
+    from PhiEx.analysis import seqtrack
+    from PhiEx.analysis.site import detect_catalytic_sites
+    monkeypatch.setattr(seqtrack, "fetch_uniprot_entry", lambda acc: None)   # offline
+    text = (Path(__file__).parent / "data" / "AF_A7F474.pdb").read_text()
+    prot, _ = pdbmod.parse_pdb_text(text, name="AF:A7F474")
+    t = seqtrack.build_track(prot, "A7F474", catalytic_hits=detect_catalytic_sites(prot))
+    assert t["is_model"] and len(t["sequence"]) == len(t["residues"]) == len(t["plddt"])
+    assert all(v is None or 0 <= v <= 100 for v in t["plddt"])
+    names = [x["name"] for x in t["tracks"]]
+    assert "catalytic motifs" in names and names[-1] == "isolate variants"
+    cat = next(x for x in t["tracks"] if x["name"] == "catalytic motifs")
+    assert any(f["type"] == "catalytic" and f["start"] == 197 for f in cat["features"])

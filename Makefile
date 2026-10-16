@@ -23,7 +23,7 @@ CONDA_TOOL   ?= $(shell command -v mamba >/dev/null 2>&1 && echo mamba || echo c
 PYTHON       := $(CONDA_TOOL) run -n $(ENV_NAME) python
 UVICORN      := $(CONDA_TOOL) run -n $(ENV_NAME) uvicorn
 
-.PHONY: env weights run test unit clean help
+.PHONY: env weights tools run test unit clean help
 
 help:
 	@echo "PhiEx — make targets:"
@@ -38,6 +38,10 @@ env:
 	@echo "==> creating conda env '$(ENV_NAME)' with $(CONDA_TOOL) (this takes ~20 min)"
 	$(CONDA_TOOL) env create -f environment.yml
 	@echo "==> done. activate with:  $(CONDA_TOOL) activate $(ENV_NAME)"
+
+tools:
+	@echo "==> installing foldseek + P2Rank into the active PhiEx env"
+	bash scripts/install_tools.sh
 
 weights: $(MODELS_DIR)
 	@echo "==> downloading ML weights into $(MODELS_DIR)"

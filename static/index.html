@@ -129,9 +129,30 @@
 
   main {
     grid-area: stage; background: var(--bg); position: relative;
-    display: grid; grid-template-rows: 1fr 1fr; gap: 1px;
+    display: grid; grid-template-rows: 1fr 1fr auto; gap: 1px;
     background: var(--rule);
   }
+  /* ————————————————— sequence viewer ————————————————— */
+  #seq-panel { background: var(--bg); padding: 6px 10px 8px; min-height: 34px; max-height: 260px; overflow: hidden;
+               display: flex; flex-direction: column; }
+  #seq-panel.collapsed #seq-body { display: none; }
+  #seq-head { display: flex; align-items: center; gap: 10px; font-size: 10px; letter-spacing: 1px;
+              color: var(--ink-dim); text-transform: uppercase; white-space: nowrap; overflow: hidden; }
+  #seq-head b { color: var(--ink); letter-spacing: 0; text-transform: none; }
+  #seq-head .legend span { display: inline-block; width: 10px; height: 10px; vertical-align: -1px; margin: 0 3px 0 8px; }
+  #seq-head button { background: none; border: 1px solid var(--rule); color: var(--ink-dim); font: inherit;
+                     font-size: 10px; padding: 1px 6px; cursor: pointer; }
+  #seq-head button:hover { color: var(--ink); border-color: var(--ink-dim); }
+  #seq-body { display: flex; gap: 10px; margin-top: 6px; min-height: 0; }
+  #seq-scroll { overflow-x: auto; overflow-y: hidden; flex: 1; position: relative; padding-bottom: 4px; }
+  #seq-scroll svg { display: block; user-select: none; }
+  #seq-scroll text { font-family: inherit; }
+  #seq-tip { position: fixed; z-index: 80; pointer-events: none; background: #000d; color: var(--ink);
+             border: 1px solid var(--rule); padding: 4px 6px; font-size: 11px; max-width: 360px; display: none; }
+  #pae-box { display: none; flex: 0 0 auto; }
+  #pae-box.on { display: block; }
+  #pae-box canvas { display: block; cursor: crosshair; border: 1px solid var(--rule); }
+  #pae-box .cap { font-size: 9px; color: var(--ink-dim); margin-top: 2px; }
   .pane { position: relative; background: var(--bg); overflow: hidden; }
   .pane .pane-label {
     position: absolute; top: 12px; left: 16px; z-index: 10;
@@ -252,7 +273,24 @@
       <div class="pane-label"><span class="sym">∃</span>EXPERIMENTAL  (PDB)  /  active-site marked</div>
       <div class="viewer" id="viewer-exp"></div>
     </div>
+    <div id="seq-panel" class="collapsed">
+      <div id="seq-head">
+        <button id="seq-toggle">▸ sequence</button>
+        <span id="seq-title">load a structure (stage 1)</span>
+        <span class="legend" id="seq-legend"></span>
+        <span style="flex:1"></span>
+        <button id="seq-refresh" title="rebuild tracks after stages 2–4">↻ tracks</button>
+        <button id="seq-pae" title="predicted aligned error (AlphaFold models)">PAE</button>
+        <button id="seq-clear" title="remove sequence highlights from 3D">clear 3D</button>
+      </div>
+      <div id="seq-body">
+        <div id="seq-scroll"></div>
+        <div id="pae-box"><canvas id="pae-canvas" width="200" height="200"></canvas>
+          <div class="cap">PAE (Å) · drag a box to highlight both ranges</div></div>
+      </div>
+    </div>
   </main>
+  <div id="seq-tip"></div>
 
   <!-- ————— RIGHT: inductive / ML readouts ————— -->
   <aside class="right">

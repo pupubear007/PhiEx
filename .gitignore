@@ -82,3 +82,4 @@ secrets.*
 *.pem
 data/candidates/
 data/ch3/
+tools/

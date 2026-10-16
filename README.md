@@ -177,6 +177,20 @@ make weights   # ~5 GB download for ESMFold + ESM-2 + MACE-OFF23
 make run       # http://localhost:8000
 ```
 
+Optional — real Foldseek and P2Rank instead of their stubs (any machine;
+the M4 Pro with 48 GB is the comfortable one for the Foldseek PDB database):
+
+```
+cd ~/PhiEx && conda activate PhiEx
+make tools     # foldseek (bioconda, or the official static binary) +
+               # P2Rank 2.4.2 + openjdk 17, all inside the PhiEx env / ./tools
+make weights   # now also builds the Foldseek PDB database under models/foldseek
+make run       # registry panel: foldseek / p2rank without the STUB tag
+```
+
+Check by hand with `foldseek version` and `prank -v`.  A different P2Rank
+release: `P2RANK_VERSION=2.5 make tools`.
+
 ### MSI (x86_64 Linux)
 
 ```
@@ -267,6 +281,28 @@ sensitivity) points to but sequence-level attention does not — candidates
 for mutagenesis around a site you trust. They are only as good as the
 site: check the *site* line in the Pockets panel (source + confidence)
 before using them.
+
+## Sequence viewer (AlphaFold-DB style)
+
+The strip under the two 3D panels (**▸ sequence**) shows the working chain
+the way the AlphaFold DB entry page does, with PhiEx's own results added:
+
+| track | source |
+|---|---|
+| sequence, coloured by pLDDT | AlphaFold / AlphaFill model B-factors (dark blue > 90, light blue 70–90, yellow 50–70, orange < 50); grey for experimental structures |
+| UniProt topology / domains / sites / PTM | UniProt entry features (signal peptide, TM, domains, active and binding sites, disulfides, glycosylation); mapped by alignment if the structure is not numbered like UniProt |
+| PhiEx site / pocket | the resolved active site (stage 3) and the residues lining the active pocket |
+| catalytic motifs | G-x-S-x-G nucleophile elbow, HGG/HGA oxyanion hole, detected Ser/Cys–His–Asp/Glu triads |
+| docked-ligand contacts | residues ≤ 4 Å from the best Vina pose (stage 4) |
+| ESM-2 constraint | per-position mean −LLR of the 19 substitutions (stage 2); bright = the language model rejects changes there |
+| isolate variants | reserved for the RNA-seq variant step (not yet filled) |
+
+* hover → residue, pLDDT and every feature covering it
+* click or drag → those residues drawn as yellow sticks in the lower 3D panel, camera centred on them; **clear 3D** removes them
+* **PAE** → AlphaFold predicted-aligned-error map (green = confident relative placement); drag a box on it to highlight both residue ranges in 3D — a quick way to see whether a domain or loop is placed reliably relative to the active site
+* **↻ tracks** rebuilds after stages 2–4 (also done automatically)
+
+Endpoints: `GET /api/sequence-track`, `GET /api/pae`.
 
 ## Candidate-gene triage (transcriptomics → structure → ligands)
 
