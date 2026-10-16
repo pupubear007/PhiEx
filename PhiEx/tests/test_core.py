@@ -375,3 +375,53 @@ def test_foldseek_target_parsing_and_single_chain():
 def test_mace_defaults_to_cpu(monkeypatch):
     monkeypatch.delenv("PHIEX_MACE_DEVICE", raising=False)
     assert MACEAdapter().device == "cpu"
+
+
+# ────────────────────────────────────────────────────────────────────────
+# AlphaFold fetch: API first, no version guessing
+# ────────────────────────────────────────────────────────────────────────
+
+class _FakeResp:
+    def __init__(self, code, payload=None, text=""):
+        self.status_code, self._p, self.text = code, payload, text
+    def json(self):
+        return self._p
+
+
+class _FakeClient:
+    routes: dict = {}
+    def __init__(self, *a, **k): pass
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def get(self, url, headers=None):
+        for key, resp in self.routes.items():
+            if key in url:
+                return resp
+        return _FakeResp(404)
+    head = get
+
+
+def test_alphafold_uses_api_url(monkeypatch, tmp_path):
+    import httpx
+    from PhiEx.adapters import pdb as pdbmod
+    pdb_line = "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 90.00           C\nEND\n"
+    _FakeClient.routes = {
+        "/api/prediction/Q00001": _FakeResp(200, [{
+            "entryId": "AF-Q00001-F1", "uniprotAccession": "Q00001", "latestVersion": 9,
+            "pdbUrl": "https://alphafold.ebi.ac.uk/files/AF-Q00001-F1-model_v9.pdb"}]),
+        "model_v9.pdb": _FakeResp(200, text=pdb_line),
+    }
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    text = pdbmod.fetch_alphafold_pdb("Q00001", cache_dir=tmp_path)
+    assert text and text.startswith("ATOM")
+
+
+def test_alphafold_absent_stops_without_guessing(monkeypatch, tmp_path):
+    import httpx
+    from PhiEx.adapters import pdb as pdbmod
+    _FakeClient.routes = {"/api/prediction/": _FakeResp(404)}
+    calls = []
+    monkeypatch.setattr(httpx, "Client", _FakeClient)
+    monkeypatch.setattr(pdbmod, "_fetch_text", lambda u, **k: calls.append(u))
+    assert pdbmod.fetch_alphafold_pdb("Q00002", cache_dir=tmp_path) is None
+    assert calls == []          # no model_vN probing once the API says "absent"

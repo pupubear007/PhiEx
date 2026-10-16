@@ -45,6 +45,52 @@ def _fetch_text(url: str, timeout: float = 15.0) -> Optional[str]:
         return None
 
 
+# AlphaFold DB file versions to probe when the API is unreachable.  The API
+# (below) is the source of truth; this list only matters offline-ish.
+_AF_VERSIONS = ("v6", "v5", "v4", "v3", "v2")
+
+
+def _alphafold_api_entry(uniprot_id: str, timeout: float = 10.0) -> "tuple[Optional[dict], str]":
+    """Ask the AlphaFold DB API which model files exist for an accession.
+
+    Returns (entry, status):
+        (dict with pdbUrl/cifUrl/latestVersion, "ok")  — model exists
+        (None, "absent")   — API answered: no prediction for this accession
+        (None, "error")    — API unreachable / unexpected; caller should
+                             fall back to probing file versions
+    Asking the API avoids hard-coding model_vN: every time AlphaFold DB bumps
+    the version, guessed URLs silently 404.
+    """
+    try:
+        import httpx
+    except ImportError:
+        return None, "error"
+    url = f"https://alphafold.ebi.ac.uk/api/prediction/{uniprot_id}"
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=True) as c:
+            r = c.get(url, headers={"User-Agent": "PhiEx/0.1",
+                                    "Accept": "application/json"})
+        if r.status_code in (400, 404, 422):
+            return None, "absent"
+        if r.status_code != 200:
+            log("sys", f"AlphaFold DB API HTTP {r.status_code} for {uniprot_id}")
+            return None, "error"
+        data = r.json()
+    except Exception as e:
+        log("sys", f"AlphaFold DB API unreachable ({e})")
+        return None, "error"
+    entries = data if isinstance(data, list) else [data]
+    entries = [e for e in entries if isinstance(e, dict) and (e.get("pdbUrl") or e.get("cifUrl"))]
+    if not entries:
+        return None, "absent"
+    # prefer the canonical full-length model for exactly this accession
+    def _rank(e):
+        acc_ok = str(e.get("uniprotAccession", "")).upper() == uniprot_id
+        f1 = str(e.get("entryId", "")).endswith("-F1")
+        return (not acc_ok, not f1)
+    return sorted(entries, key=_rank)[0], "ok"
+
+
 def list_pdbs_for_uniprot(uniprot_id: str, timeout: float = 10.0) -> list[dict]:
     """Look up every PDB entry cross-referenced from a UniProt accession.
 
@@ -163,8 +209,9 @@ def _swissmodel_summary(uniprot_id: str, timeout: float = 6.0) -> Optional[dict]
 def _alphafold_summary(uniprot_id: str, timeout: float = 6.0) -> Optional[dict]:
     """Probe AlphaFold DB and return a list-entry dict if a prediction exists.
 
-    Tries multiple model versions (v5 → v2) because AlphaFold DB bumps the
-    version periodically and old probes silently start returning 404. Falls
+    Asks the AlphaFold DB API first; only if that is unreachable does it
+    probe model versions (v6 → v2) directly, because AlphaFold DB bumps the
+    version periodically and guessed URLs silently start returning 404. Falls
     back to a small ranged GET when HEAD returns non-200, since the EBI
     CDN occasionally rejects HEAD on otherwise-fetchable static files.
     """
@@ -172,10 +219,20 @@ def _alphafold_summary(uniprot_id: str, timeout: float = 6.0) -> Optional[dict]:
         import httpx
     except ImportError:
         return None
+    entry, status = _alphafold_api_entry(uniprot_id.upper().strip(), timeout=timeout)
+    if status == "ok":
+        return {
+            "pdb_id":     f"AF:{uniprot_id}",
+            "method":     f"AlphaFold (predicted, v{entry.get('latestVersion', '?')})",
+            "resolution": None,
+            "chains":     "",
+        }
+    if status == "absent":
+        return None
     headers = {"User-Agent": "PhiEx/0.1"}
     try:
         with httpx.Client(timeout=timeout, follow_redirects=True) as c:
-            for v in ("v5", "v4", "v3", "v2"):
+            for v in _AF_VERSIONS:
                 url = f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_{v}.pdb"
                 # HEAD first (cheap)
                 try:
@@ -335,8 +392,33 @@ def fetch_alphafold_pdb(uniprot_id: str,
     cached_text = _read_cache_or_purge(cached, f"AlphaFold {uniprot_id}")
     if cached_text is not None:
         return cached_text
-    # Try v5 first (current as of 2024+); fall back to v4, v3, v2.
-    for v in ("v5", "v4", "v3", "v2"):
+    # 1) ask the API which files exist (no version guessing)
+    entry, status = _alphafold_api_entry(uniprot_id)
+    if status == "ok":
+        ver = f"v{entry.get('latestVersion', '?')}"
+        if entry.get("pdbUrl"):
+            text = _fetch_text(entry["pdbUrl"])
+            if _is_valid_pdb_text(text):
+                cached.write_text(text)
+                log("phi", f"AlphaFold {uniprot_id} ({ver}): fetched ({len(text)} bytes) and cached")
+                return text
+        if entry.get("cifUrl"):
+            cif = _fetch_text(entry["cifUrl"])
+            if cif and ("_atom_site." in cif or "loop_" in cif):
+                pdb_text = _cif_to_pdb_text(cif)
+                if _is_valid_pdb_text(pdb_text):
+                    cached.write_text(pdb_text)
+                    log("phi", f"AlphaFold {uniprot_id} ({ver}, CIF→PDB): fetched and cached")
+                    return pdb_text
+        log("sys", f"AlphaFold {uniprot_id}: API lists a model but its files did not download")
+        return None
+    if status == "absent":
+        log("sys", f"AlphaFold {uniprot_id}: AlphaFold DB has no prediction for this "
+                   f"accession (the entry may be obsolete/merged in UniProt, or "
+                   f"outside AlphaFold DB coverage) — try ESMFold on the sequence")
+        return None
+    # 2) API unreachable: probe file versions directly
+    for v in _AF_VERSIONS:
         url = f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_{v}.pdb"
         text = _fetch_text(url)
         if _is_valid_pdb_text(text):
@@ -344,7 +426,7 @@ def fetch_alphafold_pdb(uniprot_id: str,
             log("phi", f"AlphaFold {uniprot_id} ({v}): fetched ({len(text)} bytes) and cached")
             return text
     # CIF fallback for extended entries
-    for v in ("v5", "v4", "v3", "v2"):
+    for v in _AF_VERSIONS:
         url = f"https://alphafold.ebi.ac.uk/files/AF-{uniprot_id}-F1-model_{v}.cif"
         cif = _fetch_text(url)
         if cif and ("_atom_site." in cif or "loop_" in cif):
