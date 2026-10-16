@@ -9,8 +9,12 @@ from ..core.trajectory import Trajectory
 from .topology import frames_match_topology
 
 
-def rmsf_per_residue(traj: Trajectory) -> dict[int, float]:
+def rmsf_per_residue(traj: Trajectory, chain: "str | None" = None) -> dict[int, float]:
+    """Cα RMSF keyed by residue number.  Restricted to one chain (default:
+    the chain the MD simulated) because homo-oligomers repeat residue
+    numbers and the chains would overwrite each other."""
     state = traj.parent_state
+    chain = chain if chain is not None else traj.metadata.get("md_chain")
     if not state.protein.residues or not frames_match_topology(traj):
         return {}
     # find Cα atom flat indices, in iteration order of all_atoms()
@@ -18,7 +22,7 @@ def rmsf_per_residue(traj: Trajectory) -> dict[int, float]:
     idx = 0
     for r in state.protein.residues:
         for a in r.atoms:
-            if a.name == "CA":
+            if a.name == "CA" and (chain is None or r.chain == chain):
                 ca_indices[r.index] = idx
             idx += 1
     if not ca_indices:

@@ -112,13 +112,20 @@ class ESM2Adapter(LearnedModelBase):
             emb = reps[0, 1:-1, :].cpu().numpy()
             # attention: shape (layers, heads, L, L) — take last layer mean over heads
             attn = out["attentions"][0, -1].mean(0)[1:-1, 1:-1].cpu().numpy()
+            # per-position log-probabilities over the 20 amino acids — the
+            # basis of zero-shot mutation-effect scores (wild-type marginal,
+            # Meier et al. 2021): LLR = log p(mut) − log p(wt)
+            logp = torch.log_softmax(out["logits"][0, 1:-1].float(), dim=-1)
+            idx = [self._alphabet.get_idx(a) for a in AA20]
+            aa_logprobs = logp[:, idx].cpu().numpy()
         # uncertainty proxy: SD of per-residue embedding norm (NOT Bayesian
         # — documented as a heuristic in README)
         norms = (emb**2).sum(axis=1) ** 0.5
         sd = float(norms.std())
         log("s", f"ESM-2 ∃: per-residue embedding {emb.shape}  norm σ={sd:.3f}")
         return Prediction(
-            value={"embedding": emb, "attention": attn},
+            value={"embedding": emb, "attention": attn,
+                   "aa_logprobs": aa_logprobs},
             uncertainty=sd,
             meta={"model": self.name, "device": self.device,
                   "backend": self.backend, "dim": self.embedding_dim},
@@ -160,6 +167,20 @@ class ESM2Adapter(LearnedModelBase):
             meta={"model": self.name, "device": self.device,
                   "backend": self.backend, "stub": True, "dim": D},
         )
+
+
+AA20 = "ACDEFGHIKLMNPQRSTVWY"
+
+
+def mutation_llr(aa_logprobs, position: int, wt: str, mut: str) -> "float | None":
+    """ESM-2 log-likelihood ratio for a point mutation at 1-based sequence
+    position.  Negative = the language model finds the mutant less likely
+    than wild type (typically destabilising / function-disrupting)."""
+    try:
+        row = aa_logprobs[position - 1]
+        return float(row[AA20.index(mut.upper())] - row[AA20.index(wt.upper())])
+    except (IndexError, ValueError, TypeError):
+        return None
 
 
 def attention_residue_importance(attention) -> "list[float]":

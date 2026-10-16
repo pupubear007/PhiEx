@@ -15,9 +15,13 @@ from ..core.trajectory import Trajectory
 from .topology import frame_matches
 
 
-def ligand_residue_contacts(traj: Trajectory, cutoff_a: float = 4.0) -> dict[int, float]:
-    """Return per-residue contact-frequency over the trajectory."""
+def ligand_residue_contacts(traj: Trajectory, cutoff_a: float = 4.0,
+                            chain: "str | None" = None) -> dict[int, float]:
+    """Return per-residue contact-frequency over the trajectory, for one
+    chain (default: the chain the MD simulated — homo-oligomers repeat
+    residue numbers)."""
     state = traj.parent_state
+    chain = chain if chain is not None else traj.metadata.get("md_chain")
     if not traj.frames or not state.ligands:
         return {}
 
@@ -26,7 +30,7 @@ def ligand_residue_contacts(traj: Trajectory, cutoff_a: float = 4.0) -> dict[int
     idx = 0
     for r in state.protein.residues:
         for a in r.atoms:
-            if a.element.upper() != "H":
+            if a.element.upper() != "H" and (chain is None or r.chain == chain):
                 res_atoms.setdefault(r.index, []).append(idx)
             idx += 1
     n_protein_atoms = idx

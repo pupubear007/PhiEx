@@ -31,20 +31,25 @@ class VinaAdapter:
     n_poses: int = 9
     seed: int = 42
 
+    box_size: float = 22.0           # Å, cubic search box around the site
+    _why_stub: str = ""
+
     def __post_init__(self) -> None:
-        try:
-            import vina  # noqa: F401
+        missing = []
+        for mod in ("vina", "meeko", "rdkit"):
+            try:
+                __import__(mod)
+            except ImportError:
+                missing.append(mod)
+        if missing:
+            self.is_stub = True
+            self._why_stub = f"{', '.join(missing)} not installed"
+            self.backend = f"stub ({self._why_stub})"
+            log("t", f"Vina adapter: {self.backend}")
+        else:
             self.is_stub = False
-            self.backend = "vina (python bindings)"
-            log("t", "Vina adapter: vina python bindings detected")
-        except ImportError:
-            import shutil
-            if shutil.which("vina"):
-                self.is_stub = False
-                self.backend = "vina-cli"
-                log("t", "Vina adapter: vina CLI detected on PATH")
-            else:
-                log("t", f"Vina adapter: {self.backend} (vina missing)")
+            self.backend = "vina 1.2 + meeko (python)"
+            log("t", f"Vina adapter: {self.backend}")
 
     def dock(self, state: ComplexState, ligand: Ligand,
              pocket: Pocket) -> list[DockingPose]:
@@ -53,22 +58,63 @@ class VinaAdapter:
         try:
             return self._dock_real(state, ligand, pocket)
         except Exception as e:
-            log("sys", f"Vina real run failed ({e}); falling back to stub")
-            return self._dock_stub(state, ligand, pocket)
+            # Do NOT quietly substitute synthetic poses: a fake score next
+            # to a real ligand name reads as a result.  Fail loudly.
+            log("sys", f"Vina docking failed ({type(e).__name__}: {e})")
+            raise RuntimeError(f"docking failed: {e}") from e
 
     # ──────────────────────────────────────────────────────────────
-    # real
+    # real: meeko receptor + ligand prep, Vina search in a box on the site
     # ──────────────────────────────────────────────────────────────
-    def _dock_real(self, state, ligand, pocket):
-        import vina  # type: ignore
-        v = vina.Vina(sf_name="vina", seed=self.seed)
-        if state.protein.pdb_text:
-            # Vina's python API wants PDBQT; in v0 we delegate prep to the
-            # user via meditation-quality pre-baked PDBQT files.  Skip the
-            # automatic conversion — that's an explicit pre-v0 stub limit.
-            log("sys", "Vina real path expects pre-prepared PDBQT inputs (v0 simplification)")
-        # If nothing is pre-prepared, drop to stub.
-        return self._dock_stub(state, ligand, pocket)
+    def _dock_real(self, state: ComplexState, ligand: Ligand,
+                   pocket: Pocket) -> list[DockingPose]:
+        from vina import Vina  # type: ignore
+        import tempfile, os
+        center = [float(c) for c in pocket.center]
+        rec = _receptor_cached(state, center)
+        lig_pdbqt = prepare_ligand_pdbqt(ligand.smiles, seed=self.seed)
+        log("phi", f"Vina: docking {ligand.name} into {pocket.id} "
+                   f"(box {self.box_size:.0f} Å at {tuple(round(c,1) for c in center)}, "
+                   f"exhaustiveness {self.exhaustiveness})")
+        with tempfile.TemporaryDirectory() as td:
+            rec_path = os.path.join(td, "receptor.pdbqt")
+            with open(rec_path, "w") as fh:
+                fh.write(rec)
+            v = Vina(sf_name="vina", seed=self.seed, verbosity=0)
+            v.set_receptor(rigid_pdbqt_filename=rec_path)
+            v.set_ligand_from_string(lig_pdbqt)
+            v.compute_vina_maps(center=center, box_size=[self.box_size]*3)
+            v.dock(exhaustiveness=self.exhaustiveness, n_poses=self.n_poses)
+            energies = v.energies(n_poses=self.n_poses)
+            poses_txt = v.poses(n_poses=self.n_poses)
+        models = _split_pdbqt_models(poses_txt)
+        poses: list[DockingPose] = []
+        first_xyz = None
+        for k, (model, e) in enumerate(zip(models, energies)):
+            atoms = tuple(Atom(index=i, name=n, element=el, xyz=xyz)
+                          for i, (n, el, xyz) in enumerate(model))
+            if first_xyz is None:
+                first_xyz = [a.xyz for a in atoms]
+            rmsd = _rmsd_same_order([a.xyz for a in atoms], first_xyz)
+            meta = {k2: v2 for k2, v2 in ligand.metadata.items() if k2 != "crystal_ref"}
+            ref = ligand.metadata.get("crystal_ref")
+            if ref:
+                meta["crystal_rmsd"] = crystal_pose_rmsd(atoms, ref)
+            poses.append(DockingPose(
+                ligand=Ligand(name=ligand.name, smiles=ligand.smiles, atoms=atoms,
+                              metadata={**meta, "pdbqt_model": k}),
+                score=float(e[0]), score_uncertainty=0.0, pose_id=k,
+                rmsd_to_best=rmsd))
+        if not poses:
+            raise RuntimeError("Vina returned no poses")
+        log("s", f"Vina s∃: {len(poses)} poses; best = {poses[0].score:.2f} kcal/mol "
+                 f"(range {poses[0].score:.2f} … {poses[-1].score:.2f})")
+        r0 = poses[0].ligand.metadata.get("crystal_rmsd")
+        if r0 is not None:
+            verdict = "reproduces" if r0 <= 2.0 else "does NOT reproduce"
+            log("s", f"re-dock check: best pose is {r0:.2f} Å from the crystal pose — "
+                     f"docking {verdict} the experimental binding mode (≤ 2 Å)")
+        return poses
 
     # ──────────────────────────────────────────────────────────────
     # stub
@@ -83,6 +129,8 @@ class VinaAdapter:
         # with distance to the cofactor metal (to approximate Vina's
         # bias toward bound poses near catalytic geometry).
         metal = next((c.metal_atom for c in state.cofactors if c.metal_atom), None)
+        if self._why_stub:
+            log("sys", f"Vina[STUB]: {self._why_stub} — poses below are synthetic")
         for k in range(self.n_poses):
             jx = rng.gauss(0, 1.5); jy = rng.gauss(0, 1.5); jz = rng.gauss(0, 1.5)
             pos = (cx + jx, cy + jy, cz + jz)
@@ -99,7 +147,8 @@ class VinaAdapter:
             )
             poses.append(DockingPose(
                 ligand=Ligand(name=ligand.name, smiles=ligand.smiles,
-                              atoms=atoms, sdf_text=ligand.sdf_text),
+                              atoms=atoms, sdf_text=ligand.sdf_text,
+                              metadata={**ligand.metadata, "stub": True}),
                 score=score, score_uncertainty=0.0, pose_id=k,
                 rmsd_to_best=0.0 if k == 0 else float(0.5 + 0.4*k),
             ))
@@ -115,3 +164,269 @@ ASCORBATE = Ligand(
     smiles="OC[C@H](O)[C@H]1OC(=O)C(O)=C1O",
     metadata={"role": "substrate / electron donor"},
 )
+
+
+# p-nitrophenyl acetate — the standard chromogenic esterase/lipase assay
+# substrate; the default ligand when the site is a serine/cysteine hydrolase
+PNP_ACETATE = Ligand(
+    name="p-nitrophenyl acetate",
+    smiles="CC(=O)Oc1ccc(cc1)[N+](=O)[O-]",
+    metadata={"role": "model ester substrate (esterase assay)"},
+)
+
+
+def default_ligand_for_site(site) -> "Ligand | None":
+    """Default substrate when the user gives no SMILES — only where the
+    site itself says what a reasonable probe is:
+        serine/cysteine hydrolase → p-nitrophenyl acetate (esterase assay)
+        heme site                 → ascorbate (the APX reducing substrate)
+    Anything else returns None: docking an arbitrary molecule into an
+    unknown site produces numbers that look meaningful and are not."""
+    kind = getattr(site, "kind", "") or ""
+    if kind in ("serine-hydrolase", "cysteine-hydrolase"):
+        return PNP_ACETATE
+    if kind == "ligand-site" and getattr(site, "bound_ligand", None):
+        lig = ligand_from_chem_comp(site.bound_ligand)
+        if lig is not None:
+            lig.metadata["crystal_ref"] = site.bound_ligand_xyz
+            return lig
+    if (getattr(site, "cofactor", "") or "").upper().startswith("HEME"):
+        return ASCORBATE
+    return None
+
+
+# ────────────────────────────────────────────────────────────────────────
+# preparation helpers (meeko + RDKit)
+# ────────────────────────────────────────────────────────────────────────
+
+_AD_COFACTOR_TYPES = {"C": "C", "N": "N", "O": "OA", "S": "SA", "P": "P",
+                      "F": "F", "CL": "Cl", "BR": "Br", "I": "I",
+                      "FE": "Fe", "ZN": "Zn", "MG": "Mg", "MN": "Mn",
+                      "CA": "Ca", "CU": "Cu", "NI": "Ni", "CO": "Co"}
+
+
+def _near_chains(state: ComplexState, center, radius: float = 20.0) -> set:
+    chains = set()
+    for r in state.protein.residues:
+        for a in r.atoms:
+            if math.dist(a.xyz, center) <= radius:
+                chains.add(r.chain); break
+    return chains
+
+
+_RECEPTOR_CACHE: dict = {}
+
+
+def _receptor_cached(state: ComplexState, center) -> str:
+    """Receptor prep (meeko + H placement) is the slow part of a dock and is
+    identical for every ligand in a screen — cache it per structure/site."""
+    key = (state.protein.name, len(state.protein.residues),
+           tuple(round(c, 1) for c in center),
+           tuple(sorted((c.resname, c.metadata.get("role", "")) for c in state.cofactors)))
+    if key not in _RECEPTOR_CACHE:
+        if len(_RECEPTOR_CACHE) > 8:
+            _RECEPTOR_CACHE.clear()
+        _RECEPTOR_CACHE[key] = prepare_receptor_pdbqt(state, center)
+    return _RECEPTOR_CACHE[key]
+
+
+def prepare_receptor_pdbqt(state: ComplexState, center) -> str:
+    """Protein → PDBQT with meeko (adds polar H from residue templates).
+    Only chains with atoms within 20 Å of the site are kept.  Real
+    cofactors near the site (e.g. heme) are appended as rigid receptor
+    atoms with AutoDock types, because meeko has no template for them and
+    docking into a heme pocket without the heme would be meaningless."""
+    from meeko import Polymer, ResidueChemTemplates, MoleculePreparation, PDBQTWriterLegacy
+    keep = _near_chains(state, center)
+    lines = []
+    serial = 1
+    for r in state.protein.residues:
+        if keep and r.chain not in keep:
+            continue
+        for a in r.atoms:
+            x, y, z = a.xyz
+            lines.append(f"ATOM  {serial:>5d} {a.name:<4s} {r.name:<3s} {r.chain:>1s}"
+                         f"{r.index:>4d}    {x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00"
+                         f"          {a.element:>2s}")
+            serial += 1
+    lines.append("END")
+    templates = ResidueChemTemplates.create_from_defaults()
+    pol = Polymer.from_pdb_string("\n".join(lines) + "\n", templates,
+                                  MoleculePreparation(), allow_bad_res=True)
+    out = PDBQTWriterLegacy.write_from_polymer(pol)
+    rigid = out[0] if isinstance(out, tuple) else out
+    extra = []
+    for c in state.cofactors:
+        if c.metadata.get("stub") or not c.atoms:
+            continue
+        if c.metadata.get("role") == "ligand":
+            continue        # the co-crystallized ligand vacates the site for docking
+        if min(math.dist(a.xyz, center) for a in c.atoms) > 12.0:
+            continue
+        for a in c.atoms:
+            t = _AD_COFACTOR_TYPES.get(a.element.upper())
+            if t is None:
+                continue
+            x, y, z = a.xyz
+            extra.append(f"HETATM{serial:>5d} {a.name[:4]:<4s} {c.resname[:3]:<3s} X 999"
+                         f"    {x:8.3f}{y:8.3f}{z:8.3f}  1.00  0.00    +0.000 {t:<2s}")
+            serial += 1
+    body = [l for l in rigid.splitlines() if l.strip() and not l.startswith("END")]
+    return "\n".join(body + extra) + "\n"
+
+
+def prepare_ligand_pdbqt(smiles: str, seed: int = 42) -> str:
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+    from meeko import MoleculePreparation, PDBQTWriterLegacy
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"RDKit could not parse SMILES {smiles!r}")
+    mol = Chem.AddHs(mol)
+    params = AllChem.ETKDGv3()
+    params.randomSeed = seed
+    if AllChem.EmbedMolecule(mol, params) != 0:
+        raise ValueError(f"could not embed 3D coordinates for {smiles!r}")
+    try:
+        AllChem.MMFFOptimizeMolecule(mol)
+    except Exception:
+        pass
+    setups = MoleculePreparation().prepare(mol)
+    pdbqt, ok, err = PDBQTWriterLegacy.write_string(setups[0])
+    if not ok:
+        raise ValueError(f"meeko ligand prep failed: {err}")
+    return pdbqt
+
+
+def _split_pdbqt_models(text: str):
+    """Vina pose PDBQT → [[(atom_name, element, xyz), ...] per model],
+    heavy atoms only (Vina's H are united-atom bookkeeping)."""
+    models, cur = [], None
+    for l in text.splitlines():
+        if l.startswith("MODEL"):
+            cur = []
+        elif l.startswith("ENDMDL"):
+            if cur is not None:
+                models.append(cur)
+            cur = None
+        elif l.startswith(("ATOM", "HETATM")) and cur is not None:
+            adt = l[77:79].strip()
+            if adt in ("H", "HD", "HS"):
+                continue
+            el = {"A": "C", "OA": "O", "NA": "N", "SA": "S", "HD": "H"}.get(adt, adt[:1] or "C")
+            cur.append((l[12:16].strip(), el,
+                        (float(l[30:38]), float(l[38:46]), float(l[46:54]))))
+    if cur:
+        models.append(cur)
+    return models
+
+
+def _rmsd_same_order(a, b) -> float:
+    if not a or len(a) != len(b):
+        return 0.0
+    return math.sqrt(sum(math.dist(p, q) ** 2 for p, q in zip(a, b)) / len(a))
+
+
+# ────────────────────────────────────────────────────────────────────────
+# ligand input: SMILES or a compound name
+# ────────────────────────────────────────────────────────────────────────
+
+_NAME_CACHE: dict = {}
+
+
+def resolve_ligand_input(text: str, name: str = "") -> Ligand:
+    """Turn what the user typed into a Ligand.
+
+    * a valid SMILES (checked with RDKit) is used as-is;
+    * otherwise the text is treated as a compound name and looked up on
+      PubChem (e.g. "p-nitrophenyl butyrate", "tributyrin", "ascorbic acid");
+    * otherwise ValueError with a message the UI can show.
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("empty ligand")
+    try:
+        from rdkit import Chem, RDLogger
+        RDLogger.DisableLog("rdApp.*")
+        mol = Chem.MolFromSmiles(text)
+    except ImportError:
+        mol = None
+    if mol is not None and mol.GetNumAtoms() > 0:
+        return Ligand(name=name or "custom ligand", smiles=text)
+    smiles = _pubchem_smiles(text)
+    if smiles:
+        log("s", f"ligand: '{text}' resolved on PubChem → {smiles}")
+        return Ligand(name=name or text, smiles=smiles,
+                      metadata={"source": "pubchem", "query": text})
+    raise ValueError(f"'{text}' is not a valid SMILES and was not found on PubChem "
+                     f"by name — enter a SMILES (e.g. CCCC(=O)Oc1ccc(cc1)[N+](=O)[O-]) "
+                     f"or a compound name (e.g. p-nitrophenyl butyrate)")
+
+
+def _pubchem_smiles(name: str) -> "str | None":
+    key = name.lower()
+    if key in _NAME_CACHE:
+        return _NAME_CACHE[key]
+    try:
+        import httpx
+        from urllib.parse import quote
+        url = ("https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/"
+               f"{quote(name)}/property/SMILES,IsomericSMILES,CanonicalSMILES/JSON")
+        r = httpx.get(url, timeout=10.0, headers={"User-Agent": "PhiEx/0.1"})
+        if r.status_code != 200:
+            _NAME_CACHE[key] = None
+            return None
+        props = (r.json().get("PropertyTable", {}).get("Properties") or [{}])[0]
+        smi = (props.get("SMILES") or props.get("IsomericSMILES")
+               or props.get("CanonicalSMILES"))
+        _NAME_CACHE[key] = smi
+        return smi
+    except Exception as e:
+        log("sys", f"PubChem lookup for '{name}' failed ({e})")
+        return None
+
+
+def ligand_from_chem_comp(comp_id: str) -> "Ligand | None":
+    """SMILES of a PDB chemical component (e.g. a co-crystallized ligand)
+    from the RCSB chem-comp API, so it can be re-docked."""
+    try:
+        import httpx
+        r = httpx.get(f"https://data.rcsb.org/rest/v1/core/chemcomp/{comp_id.upper()}",
+                      timeout=10.0, headers={"User-Agent": "PhiEx/0.1"})
+        if r.status_code != 200:
+            return None
+        d = r.json()
+        desc = d.get("rcsb_chem_comp_descriptor") or {}
+        smi = desc.get("smilesstereo") or desc.get("smiles")
+        name = (d.get("chem_comp") or {}).get("name") or comp_id
+        if not smi:
+            return None
+        log("s", f"ligand: co-crystallized {comp_id} ({name.lower()}) → re-docking")
+        return Ligand(name=f"{comp_id} (co-crystal)", smiles=smi,
+                      metadata={"source": "rcsb-chemcomp", "comp_id": comp_id})
+    except Exception as e:
+        log("sys", f"RCSB chem-comp lookup for {comp_id} failed ({e})")
+        return None
+
+
+def crystal_pose_rmsd(pose_atoms, ref) -> "float | None":
+    """Heavy-atom RMSD between a docked pose and the crystal pose, with
+    atoms matched by element (Hungarian assignment) — PDBQT and PDB atom
+    orders differ.  < 2 Å is the usual 'docking reproduced the crystal' bar."""
+    try:
+        import numpy as np
+        from scipy.optimize import linear_sum_assignment
+    except ImportError:
+        return None
+    pa = [(a.element.upper(), a.xyz) for a in pose_atoms if a.element.upper() != "H"]
+    if not pa or not ref or abs(len(pa) - len(ref)) > max(2, 0.2 * len(ref)):
+        return None
+    total, n = 0.0, 0
+    for el in {e for e, _ in pa}:
+        P = np.array([x for e, x in pa if e == el]); Q = np.array([x for e, x in ref if e == el])
+        if len(Q) == 0:
+            continue
+        D = ((P[:, None, :] - Q[None, :, :]) ** 2).sum(-1)
+        i, j = linear_sum_assignment(D)
+        total += float(D[i, j].sum()); n += len(i)
+    return (total / n) ** 0.5 if n else None

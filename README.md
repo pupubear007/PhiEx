@@ -201,6 +201,73 @@ make test           # apx_end_to_end sanity check
 make unit           # fast unit tests (pytest, no ML weights or network)
 ```
 
+## Using it on your own protein
+
+PhiEx is no longer tied to APX. For any structure (`1ABC`, or `AF:<UniProt>`
+for an AlphaFold model) it decides **where the active site is** before
+anything else, and every later stage — pocket, docking box, MD analysis,
+MACE region, mutation panel, discovery flags — is built around that site.
+
+**Site resolution, in priority order** (`PhiEx/analysis/site.py`):
+
+| # | source | when | confidence |
+|---|--------|------|------------|
+| 1 | **your anchor** — the *Site anchor* box / `anchor` API field, e.g. `S197,H351,E314`, `Ser197`, `A:197` | always wins | `user` |
+| 2 | **real cofactor** in the structure (heme Fe, FAD, NAD …) | crystal structures with HETATM cofactors | `high` |
+| 3 | **catalytic triad/dyad** found geometrically: Ser/Cys–His–Asp/Glu hydrogen-bond network (≤ 3.6 Å), boosted by a G‑x‑S‑x‑G nucleophile-elbow motif | serine / cysteine hydrolases, esterases, lipases, proteases | `high` with motif + acid, else `medium` |
+| 4 | **top P2Rank pocket** | nothing above found | `medium` (`low` with the geometric fallback) |
+| 5 | protein centroid | nothing at all | `low` |
+
+No cofactor is ever invented: the v0 code used to place a synthetic heme
+next to residue 42 (APX's catalytic His) on *every* protein, which put the
+whole downstream analysis in the wrong place for anything that is not APX.
+
+**Ligand:** give a SMILES in the *Ligand SMILES* box (`ligand_smiles` in
+the API). Without one, a default is chosen from the site type: hydrolase
+sites get p‑nitrophenyl acetate (the standard esterase assay substrate),
+everything else ascorbate.
+
+**What each stage now computes, and how real it is**
+
+| stage | real when | otherwise |
+|-------|-----------|-----------|
+| docking | `vina` + `meeko` + `rdkit` installed — receptor H added by meeko, 22 Å box on the site, cofactors near the site kept as rigid receptor atoms | labelled `[STUB]` poses |
+| pose contacts | real docking ran — residues ≤ 4 Å of the best pose | — |
+| MD | OpenMM: protein-only, chain holding the site, H added (pdbfixer rebuilds missing side-chain atoms), OBC2 implicit solvent, 2 fs; frames mapped back by (chain, residue, atom) so RMSF and contacts work. Uses the OpenCL GPU platform on Apple Silicon when available | stub harmonic trajectory, labelled |
+| residence time | — the ligand is **not** simulated (no small-molecule force field in v0); reported as *n/a* instead of a fake number | — |
+| mutation scores (AL objective) | ESM-2 loaded: zero-shot mutation effect, −LLR = log p(wt) − log p(mut) at that position (Meier et al. 2021). Larger = more disruptive. It does **not** model ligand binding | BLOSUM heuristic, labelled `SYNTHETIC` |
+| discovery flags | residues supported by AL / MD contacts / docked-pose contacts but not by ESM-2 attention | skipped when ESM-2 is a stub |
+
+**Hetero groups in the structure** (`classify_het` in `adapters/pdb.py`) are
+sorted by role: known **cofactors** (heme, FAD/FMN, NAD(P)(H), PLP, TPP, CoA,
+SAM/SAH, ATP/ADP/GTP/GDP, Fe–S clusters, molybdopterin, cobalamin, biotin,
+chlorophylls, …) and **catalytic metals** (Zn, Fe, Cu, Mn, Ni, Co, Mo, …)
+stay in the receptor and can define the site; **structural ions** (Ca, Mg)
+stay in the receptor but never define it; **co-crystallized ligands**
+(inhibitors, substrate analogs) define the site but are removed from the
+receptor — leave *Ligand* empty and PhiEx fetches the ligand's SMILES from
+RCSB and **re-docks it**, reporting the pose RMSD to the crystal (≤ 2 Å means
+docking reproduces the experimental binding mode). Waters, buffers,
+cryoprotectants, glycans and modified residues are ignored; MSE is read as
+Met. For AlphaFold models use the `AFILL:<UniProt>` entry — AlphaFill
+transplants cofactors and ligands from homologous structures.
+
+**Ligand screen** (stage 4b, `POST /api/dock/batch`, CSV at
+`/api/dock/batch.csv`): paste up to 50 ligands, one per line — a SMILES, a
+compound name (PubChem), or `label: SMILES-or-name`. Each is docked into the
+same site with the same settings and the table ranks them by Vina score with
+ligand efficiency (−score / heavy atoms), the site residues each pose touches,
+and distance to the site centre. Include a known substrate and a negative
+control: Vina scores carry ~±2 kcal/mol error, so trust the ranking and the
+contacts, not the absolute numbers.
+
+**How to read the discovery flags now:** they are site residues that the
+structure-based evidence (docked-pose contacts, MD contacts, mutation
+sensitivity) points to but sequence-level attention does not — candidates
+for mutagenesis around a site you trust. They are only as good as the
+site: check the *site* line in the Pockets panel (source + confidence)
+before using them.
+
 ## Known simplifications and stubs (called out explicitly)
 
 These are the v0 corners. Each is a localised swap; the repo's adapters
@@ -224,21 +291,16 @@ do not bake them in elsewhere.
   is computed after Kabsch superposition.
 * **MACE-OFF23** runs on CPU by default (`PHIEX_MACE_DEVICE` to change):
   the checkpoint is float64, which MPS cannot hold during loading.
-* **Trajectory analysis requires a matching atom layout.** Contacts,
-  RMSF and residence index frame positions in the order protein →
-  cofactors → ligands. The real OpenMM path builds its system from the
-  raw PDB text, so its atoms usually don't line up (waters in, docked
-  ligand out); analysis then reports "unavailable" rather than
-  mis-indexing.
-* **OpenMM heme parametrization** is the gap that most often forces the
-  stub MD path on real hardware. Production heme parametrization
-  requires GAFF or a custom XML; v0 falls back to a synthetic harmonic
-  trajectory if `ForceField.createSystem` fails on the cofactor. Logged
-  as `[STUB]` in the ticker.
-* **MACE region selection** uses the explicit heuristic
-  *"heme atoms first, ligand atoms second, nearest residues by
-  Cα-distance-to-Fe third, capped at 50 atoms"*. Documented in
-  `adapters/mace.py::select_active_site_region`.
+* **MD is protein-only.** The docked ligand and cofactors are held at
+  their input coordinates; residence time is therefore not computed.
+  Parametrizing the ligand (GAFF/OpenFF via `openmmforcefields`) is the
+  next step for ligand dynamics.
+* **MACE region selection**: ligand atoms first, cofactor atoms within
+  6 Å of the site second, nearest residues by Cα distance to the site
+  centre third, capped at 50 atoms; elements outside MACE-OFF23's
+  training set (e.g. Fe) are dropped. The region has no hydrogens or
+  caps, so its absolute energy is not physically meaningful — compare
+  values only between runs of the same system.
 * **Surrogate perturbation encoding** concatenates a small set of
   hand-picked features (one-hot type, residue position, BLOSUM62 score,
   temperature offset, Morgan-256 fingerprint). Documented in

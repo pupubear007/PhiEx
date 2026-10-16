@@ -101,6 +101,11 @@ def select_openmm_platform():
              for i in range(Platform.getNumPlatforms())}
     if "Metal" in avail:
         return "Metal", {}
+    # Apple Silicon: OpenMM's OpenCL platform runs on the GPU and is
+    # typically several times faster than CPU for implicit-solvent MD
+    if "OpenCL" in avail and platform.system() == "Darwin" \
+            and os.environ.get("PHIEX_OPENMM_PLATFORM", "").upper() != "CPU":
+        return "OpenCL", {}
     if "CUDA" in avail and os.environ.get("PHIEX_DEVICE", "").lower() == "cuda":
         return "CUDA", {"Precision": "mixed"}
     return "CPU", {}
