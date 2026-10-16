@@ -322,7 +322,8 @@ def api_dock(req: DockRequest):
     if ligand is None:
         kind = site.kind if site else "unknown"
         return JSONResponse({"error": f"no ligand given and no default substrate for a "
-                                      f"{kind} site — enter a SMILES in 'Ligand SMILES'"},
+                                      f"{kind} site — enter a SMILES or compound name in "
+                                      f"'Ligand' (or paste a list under stage 4 and press 4b)"},
                             status_code=400)
     state = ComplexState(protein=protein, cofactors=tuple(cofactors), ligands=(ligand,),
                          metadata={"site_center": site.center} if site else {})

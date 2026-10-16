@@ -633,6 +633,8 @@ def test_hetero_groups_are_classified_by_role():
     assert classify_het("GOL", many(6)) is None                # cryoprotectant
     assert classify_het("NAG", many(14)) is None               # glycan
     assert classify_het("STI", many(37)) == ("STI", "ligand")  # inhibitor
+    assert classify_het("ACP", many(31)) == ("AMP-PCP", "ligand")   # nucleotide analog: substrate site
+    assert classify_het("ADP", many(27)) == ("ADP", "ligand")
     modified = [Atom(0, "N", "N", (0, 0, 0)), Atom(1, "CA", "C", (1, 0, 0)),
                 Atom(2, "C", "C", (2, 0, 0))] + many(5)
     assert classify_het("CAS", modified) is None               # modified residue

@@ -437,7 +437,7 @@ def pick_ligand(site: Optional[ActiveSite], smiles: Optional[str],
     kind = getattr(site, "kind", "unknown")
     if lig is None:
         log("sys", f"no ligand SMILES given and no default substrate for a {kind} "
-                   f"site — docking skipped. Enter a SMILES in 'Ligand SMILES' to dock.")
+                   f"site — docking skipped. Enter a SMILES or name in 'Ligand' to dock.")
     else:
         log("sys", f"no ligand SMILES given — default for a {kind} site: {lig.name} "
                    f"(enter a SMILES to dock your own ligand)")

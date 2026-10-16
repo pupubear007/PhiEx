@@ -705,8 +705,6 @@ _KNOWN_COFACTORS = {
     "PLP": "PLP", "PMP": "PMP", "LLP": "PLP-Lys",
     "TPP": "TPP", "TDP": "TDP", "COA": "CoA", "ACO": "acetyl-CoA",
     "SAM": "SAM", "SAH": "SAH", "SFG": "sinefungin",
-    "ATP": "ATP", "ADP": "ADP", "ANP": "AMP-PNP", "ACP": "AMP-PCP", "AGS": "ATP-γS",
-    "GTP": "GTP", "GDP": "GDP", "GNP": "GMP-PNP",
     "SF4": "[4Fe-4S]", "FES": "[2Fe-2S]", "F3S": "[3Fe-4S]",
     "MGD": "Mo-bisMGD", "MTE": "molybdopterin", "PCD": "Mo-pterin",
     "B12": "cobalamin", "CNC": "cyanocobalamin", "COB": "Co-methylcobalamin",
@@ -716,6 +714,16 @@ _KNOWN_COFACTORS = {
     "RET": "retinal", "F42": "F420", "FMT_": "",
 }
 _KNOWN_COFACTORS.pop("FMT_")
+# Nucleotides and their non-hydrolysable analogs bind as substrates/products
+# (kinases, ATPases, GTPases, synthetases), not as permanent prosthetic
+# groups: role "ligand", so they mark the site, vacate it for docking, and
+# are re-docked by default.
+_SUBSTRATE_LIKE = {
+    "ATP": "ATP", "ADP": "ADP", "AMP": "AMP", "ANP": "AMP-PNP", "ACP": "AMP-PCP",
+    "AGS": "ATP-γS", "APC": "AMP-CPP", "GTP": "GTP", "GDP": "GDP", "GNP": "GMP-PNP",
+    "GSP": "GTP-γS", "GCP": "GMP-PCP", "CTP": "CTP", "UTP": "UTP", "UDP": "UDP",
+    "TTP": "dTTP", "POP": "pyrophosphate", "PPV": "pyrophosphate", "3PO": "triphosphate",
+}
 _CATALYTIC_METALS = {"ZN", "FE", "FE2", "CU", "CU1", "MN", "NI", "CO", "MO", "W", "V", "CD"}
 _STRUCTURAL_IONS = {"CA", "MG"}
 _DROP = {
@@ -743,6 +751,8 @@ def classify_het(resname: str, atoms) -> "tuple[str, str] | None":
         return None                         # modified amino acid in the chain, not a ligand
     if rn in _KNOWN_COFACTORS:
         return _KNOWN_COFACTORS[rn], "cofactor"
+    if rn in _SUBSTRATE_LIKE:
+        return _SUBSTRATE_LIKE[rn], "ligand"
     heavy = [a for a in atoms if a.element.upper() != "H"]
     if len(heavy) == 1:
         el = heavy[0].element.upper()
@@ -751,7 +761,7 @@ def classify_het(resname: str, atoms) -> "tuple[str, str] | None":
         if rn in _STRUCTURAL_IONS or el in _STRUCTURAL_IONS:
             return el.title(), "ion"
         return None                         # other single atoms: ions from buffer
-    if len(heavy) < 6:
+    if len(heavy) < 6 and rn not in _SUBSTRATE_LIKE:
         return None                         # small fragments (ethanol, acetate …)
     return rn, "ligand"
 

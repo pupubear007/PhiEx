@@ -238,7 +238,9 @@ def site_from_cofactors(protein: Protein, cofactors: list[Cofactor]) -> Optional
     if role == "ligand":
         center = _mean(a.xyz for a in c.atoms if a.element.upper() != "H")
         return ActiveSite(center=center, source="bound-ligand",
-                          label=f"co-crystallized {c.resname}", confidence="high",
+                          label=f"co-crystallized {c.name if c.name != c.resname else c.resname}"
+                                + (f" ({c.resname})" if c.name != c.resname else ""),
+                          confidence="high",
                           kind="ligand-site", chain=chain, cofactor=None,
                           bound_ligand=c.resname,
                           bound_ligand_xyz=tuple((a.element.upper(), a.xyz) for a in c.atoms
