@@ -65,6 +65,7 @@ dependencies:
   - numba
   - matplotlib
   - omegaconf       # required by fair-esm's ESMFold loader
+  - pytest          # `make unit`
 
   # ─── Structural bio ─────────────────────────────────────
   - mdanalysis

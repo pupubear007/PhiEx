@@ -22,10 +22,10 @@ import json
 import math
 import random
 import sys
+import zlib
 
 from ..adapters.surrogate import GBRSurrogate, encode_perturbation
-from ..al import (ActiveLearningLoop, UCBAcquisition,
-                  ExpectedImprovementAcquisition, ThompsonAcquisition)
+from ..al import ActiveLearningLoop, make_acquisition
 from ..ticker import log
 
 
@@ -42,27 +42,22 @@ def synthetic_evaluator(p: dict) -> tuple[float, float]:
     pos = res / 250.0
     target = 1.5 * math.sin(6.0 * pos) - 0.5 * math.cos(10.0 * pos) \
              + 0.05 * (pos - 0.4) ** 2
-    rng = random.Random(hash((res, p.get("from"), p.get("to"))) & 0xFFFFFFFF)
+    # zlib.crc32, not hash(): str hashing is salted per process
+    # (PYTHONHASHSEED), which made this "deterministic" noise differ run to run.
+    key = f"{int(res)}:{p.get('from')}:{p.get('to')}".encode()
+    rng = random.Random(zlib.crc32(key))
     return target + rng.gauss(0, 0.1), 0.1
-
-
-_ACQS = {
-    "ucb": UCBAcquisition,
-    "ei": ExpectedImprovementAcquisition,
-    "thompson": ThompsonAcquisition,
-}
 
 
 def run_batch_payload(payload: dict) -> dict:
     candidates = payload["candidates"]
     n_iter = int(payload.get("n_iterations", 3))
-    acq_name = payload.get("acquisition", "ucb")
-    acq_cls = _ACQS.get(acq_name, UCBAcquisition)
+    acquisition = make_acquisition(payload.get("acquisition", "ucb"))
 
     surrogate = GBRSurrogate()
     loop = ActiveLearningLoop(surrogate=surrogate,
                               evaluator=synthetic_evaluator,
-                              acquisition=acq_cls())
+                              acquisition=acquisition)
     seed_n = min(5, max(2, len(candidates)//4))
     loop.seed(candidates[:seed_n])
     loop.set_candidates(candidates[seed_n:])
@@ -72,8 +67,6 @@ def run_batch_payload(payload: dict) -> dict:
         if not loop.candidates:
             break
         r = loop.iterate()
-        # remove the chosen candidate so we don't re-pick it
-        loop.candidates = [c for c in loop.candidates if c != r.chosen]
         results.append(_result_to_json(r))
     return {
         "n_iterations": len(results),

@@ -1,14 +1,14 @@
 """
 PhiEx.device — compute device selection.
 
-This is a thin re-export of the project's authoritative device.py at the
-repository root.  Import from here in package code:
+This module is the single source of truth for device selection.  Import
+from here in package code:
 
     from PhiEx.device import select_device, describe_device
 
-The root-level device.py (delivered as scaffolding) is the single source of
-truth so a freshly cloned repo behaves identically whether the user imports
-`device` (top-level) or `PhiEx.device` (package).
+The root-level device.py is a thin shim that re-exports this module, so a
+freshly cloned repo behaves identically whether the user imports `device`
+(top-level) or `PhiEx.device` (package).
 
 Choice order:
     1.  explicit override via PHIEX_DEVICE env var ("cpu", "mps", "cuda")

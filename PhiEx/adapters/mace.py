@@ -136,17 +136,17 @@ class MACEAdapter(LearnedModelBase):
     def forces(self, state: ComplexState):
         # forces require a richer prediction in real mode; the stub
         # returns zeros to satisfy the protocol
+        region = select_active_site_region(state, self.max_atoms)
         if self.is_stub:
-            return [(0.0, 0.0, 0.0) for _ in select_active_site_region(state, self.max_atoms)]
+            return [(0.0, 0.0, 0.0) for _ in region]
         try:
-            from ase import Atoms  # type: ignore
-            atoms = self._to_ase(state)
-            atoms.set_calculator(self._calc)
+            atoms = self._to_ase_atoms(region)
+            atoms.calc = self._calc
             f = atoms.get_forces()
-            return [tuple(v) for v in f]
+            return [tuple(float(c) for c in v) for v in f]
         except Exception as e:
             log("sys", f"MACE forces failed ({e}); zeros returned")
-            return [(0.0, 0.0, 0.0) for _ in range(self.max_atoms)]
+            return [(0.0, 0.0, 0.0) for _ in region]
 
     # ──────────────────────────────────────────────────────────────
     # LearnedModel surface
@@ -159,9 +159,8 @@ class MACEAdapter(LearnedModelBase):
 
     def _predict_real(self, state, region):
         try:
-            from ase import Atoms  # type: ignore
             atoms = self._to_ase_atoms(region)
-            atoms.set_calculator(self._calc)
+            atoms.calc = self._calc
             energy = float(atoms.get_potential_energy())
             # ensemble sigma: real MACE-OFF23 small ships a single model;
             # we treat ensemble as 1 with a placeholder uncertainty driven

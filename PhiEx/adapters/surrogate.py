@@ -42,18 +42,35 @@ from ..device import select_device
 # ────────────────────────────────────────────────────────────────────────
 
 _AA_INDEX = {aa: i for i, aa in enumerate("ACDEFGHIKLMNPQRSTVWY-")}
-# tiny BLOSUM62 substring (diagonal-only + a few representative off-diags)
+# Full BLOSUM62 (Henikoff & Henikoff 1992) over the 20 standard amino acids.
+# Unknown residues (X, B, Z, gaps) score 0 via .get(..., 0).
+_BLOSUM62_ORDER = "ARNDCQEGHILKMFPSTWYV"
+_BLOSUM62_ROWS = """
+ 4 -1 -2 -2  0 -1 -1  0 -2 -1 -1 -1 -1 -2 -1  1  0 -3 -2  0
+-1  5  0 -2 -3  1  0 -2  0 -3 -2  2 -1 -3 -2 -1 -1 -3 -2 -3
+-2  0  6  1 -3  0  0  0  1 -3 -3  0 -2 -3 -2  1  0 -4 -2 -3
+-2 -2  1  6 -3  0  2 -1 -1 -3 -4 -1 -3 -3 -1  0 -1 -4 -3 -3
+ 0 -3 -3 -3  9 -3 -4 -3 -3 -1 -1 -3 -1 -2 -3 -1 -1 -2 -2 -1
+-1  1  0  0 -3  5  2 -2  0 -3 -2  1  0 -3 -1  0 -1 -2 -1 -2
+-1  0  0  2 -4  2  5 -2  0 -3 -3  1 -2 -3 -1  0 -1 -3 -2 -2
+ 0 -2  0 -1 -3 -2 -2  6 -2 -4 -4 -2 -3 -3 -2  0 -2 -2 -3 -3
+-2  0  1 -1 -3  0  0 -2  8 -3 -3 -1 -2 -1 -2 -1 -2 -2  2 -3
+-1 -3 -3 -3 -1 -3 -3 -4 -3  4  2 -3  1  0 -3 -2 -1 -3 -1  3
+-1 -2 -3 -4 -1 -2 -3 -4 -3  2  4 -2  2  0 -3 -2 -1 -2 -1  1
+-1  2  0 -1 -3  1  1 -2 -1 -3 -2  5 -1 -3 -1  0 -1 -3 -2 -2
+-1 -1 -2 -3 -1  0 -2 -3 -2  1  2 -1  5  0 -2 -1 -1 -1 -1  1
+-2 -3 -3 -3 -2 -3 -3 -3 -1  0  0 -3  0  6 -4 -2 -2  1  3 -1
+-1 -2 -2 -1 -3 -1 -1 -2 -2 -3 -3 -1 -2 -4  7 -1 -1 -4 -3 -2
+ 1 -1  1  0 -1  0  0  0 -1 -2 -2  0 -1 -2 -1  4  1 -3 -2 -2
+ 0 -1  0 -1 -1 -1 -1 -2 -2 -1 -1 -1 -1 -2 -1  1  5 -2 -2  0
+-3 -3 -4 -4 -2 -2 -3 -2 -2 -3 -2 -3 -1  1 -4 -3 -2 11  2 -3
+-2 -2 -2 -3 -2 -1 -2 -3  2 -1 -1 -2 -1  3 -3 -2 -2  2  7 -1
+ 0 -3 -3 -3 -1 -2 -2 -3 -3  3  1 -2  1 -1 -2 -2  0 -3 -1  4
+"""
 _BLOSUM62 = {
-    ("A","A"):4,("R","R"):5,("N","N"):6,("D","D"):6,("C","C"):9,("Q","Q"):5,
-    ("E","E"):5,("G","G"):6,("H","H"):8,("I","I"):4,("L","L"):4,("K","K"):5,
-    ("M","M"):5,("F","F"):6,("P","P"):7,("S","S"):4,("T","T"):5,("W","W"):11,
-    ("Y","Y"):7,("V","V"):4,
-    ("R","K"):2,("K","R"):2,
-    ("D","E"):2,("E","D"):2,
-    ("F","Y"):3,("Y","F"):3,
-    ("S","T"):1,("T","S"):1,
-    ("I","V"):3,("V","I"):3,("I","L"):2,("L","I"):2,("L","V"):1,("V","L"):1,
-    ("A","S"):1,("S","A"):1,
+    (a, b): int(v)
+    for a, row in zip(_BLOSUM62_ORDER, _BLOSUM62_ROWS.split("\n")[1:])
+    for b, v in zip(_BLOSUM62_ORDER, row.split())
 }
 
 
@@ -162,8 +179,14 @@ class GBRSurrogate(LearnedModelBase):
         log("t", f"surrogate[STUB] tϕ refit: n={len(X)} (mean fallback)")
         return FitReport(n_samples=len(X), rmse=None, r2=None, stub=True)
 
+    def encode(self, perturbation: dict) -> "list[float]":
+        """Feature vector for `perturbation`, normalised by this surrogate's
+        sequence length.  Callers building training data must use this (not
+        the bare module function) so fit-time and predict-time features agree."""
+        return encode_perturbation(perturbation, self.sequence_length)
+
     def predict(self, perturbation: dict) -> Prediction:
-        x = encode_perturbation(perturbation, self.sequence_length)
+        x = self.encode(perturbation)
         if not self._trained:
             return Prediction(value=0.0, uncertainty=1.0,
                               meta={"model": self.name, "device": self.device,

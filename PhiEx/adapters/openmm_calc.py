@@ -172,10 +172,16 @@ class OpenMMSimulator:
         traj = Trajectory(parent_state=state, label=label or "openmm-stub",
                           metadata={"stub": True})
         kT = 0.026 * (self.temperature_k / 298.0)        # eV (very rough)
-        # Take backbone positions from the parent state and add a Gaussian
-        # wiggle every report_every_fs.  This is enough to drive the analysis
-        # layer (contacts, RMSF) without OpenMM.
+        # Take positions from the parent state and add a Gaussian wiggle
+        # every report_every_fs.  This is enough to drive the analysis layer
+        # (contacts, RMSF, residence) without OpenMM.  Atom order must match
+        # what the analysis layer assumes: protein, then cofactors, then
+        # ligands — omitting the last two left contacts/residence at zero.
         atoms = list(state.protein.all_atoms())
+        for c in state.cofactors:
+            atoms.extend(c.atoms)
+        for L in state.ligands:
+            atoms.extend(L.atoms)
         n_steps = int((self.total_ps * 1000.0) / self.step_fs)
         report_every = max(1, int(self.report_every_fs / self.step_fs))
         for step in range(report_every, n_steps + 1, report_every):

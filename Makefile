@@ -5,6 +5,7 @@
 #   make weights   Download ML weights into ./models (one-time, ~5 GB)
 #   make run       Start the backend + serve the UI
 #   make test      End-to-end APX sandbox sanity check
+#   make unit      Fast unit tests (no weights, no network)
 #   make clean     Remove caches (not the conda env, not the weights)
 #
 # Works with either `mamba` (faster) or stock `conda`.  Auto-detects which
@@ -22,7 +23,7 @@ CONDA_TOOL   ?= $(shell command -v mamba >/dev/null 2>&1 && echo mamba || echo c
 PYTHON       := $(CONDA_TOOL) run -n $(ENV_NAME) python
 UVICORN      := $(CONDA_TOOL) run -n $(ENV_NAME) uvicorn
 
-.PHONY: env weights run test clean help
+.PHONY: env weights run test unit clean help
 
 help:
 	@echo "PhiEx — make targets:"
@@ -30,6 +31,7 @@ help:
 	@echo "  weights  download ML weights to $(MODELS_DIR)"
 	@echo "  run      launch FastAPI backend at http://localhost:8000"
 	@echo "  test     run the APX end-to-end example"
+	@echo "  unit     run fast unit tests (pytest)"
 	@echo "  clean    remove caches (keeps env and weights)"
 
 env:
@@ -55,6 +57,10 @@ test:
 	PYTORCH_ENABLE_MPS_FALLBACK=1 \
 	PHIEX_MODELS_DIR=$(MODELS_DIR) \
 	$(PYTHON) -m PhiEx.tests.apx_end_to_end
+
+unit:
+	@echo "==> running unit tests"
+	$(PYTHON) -m pytest PhiEx/tests -q
 
 clean:
 	@echo "==> removing __pycache__, .pytest_cache, trajectory scratch"

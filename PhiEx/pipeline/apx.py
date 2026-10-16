@@ -247,30 +247,24 @@ class APXPipeline:
             surrogate = GBRSurrogate(sequence_length=max(1, len(protein.sequence)))
             THEORIES.register(surrogate)
 
-            # The v0 evaluator: a cheap proxy that uses MACE on the active-site
-            # region energy *delta* between perturbed and unperturbed docked
-            # complex.  We simulate this by perturbing a residue's local
-            # geometry and re-evaluating MACE energy.  For headless tests
-            # without MACE this still works because the MACE stub responds
-            # deterministically.
+            # The v0 evaluator is a cheap proxy (README "Known simplifications").
+            # We don't actually mutate the structure in v0, so the MACE
+            # energy of the docked complex is the same for every candidate:
+            # evaluate it once and use its ensemble σ as the observation noise.
+            from ..adapters.surrogate import _BLOSUM62
+            base_pred = mace.predict(docked)
+            base_sd = float(base_pred.uncertainty or 0.05)
+
             def evaluator(p: dict) -> tuple[float, float]:
                 resid = p.get("residue", 0)
                 if resid <= 0 or resid > len(protein.sequence):
                     return 0.0, 1.0
-                # construct a perturbed state (BLOSUM-driven scalar; we don't
-                # actually mutate the structure in v0 — heuristic, called
-                # out in README)
-                pred = mace.predict(docked)
-                base_e = float(pred.value)
-                # synthetic mutation effect: penalise mutations of conserved
-                # residues by their BLOSUM score
-                from ..adapters.surrogate import _BLOSUM62
+                # synthetic mutation effect (heuristic, called out in README):
+                # penalise mutations of conserved residues by their BLOSUM score
                 wt = p.get("from"); to = p.get("to")
                 blosum = _BLOSUM62.get((wt, to), 0)
                 delta = -0.3 * (5 - blosum) + 0.1 * math.sin(0.3 * resid)
-                e = base_e + delta
-                sd = float(pred.uncertainty or 0.05)
-                return e - base_e, sd
+                return delta, base_sd
 
             loop = ActiveLearningLoop(
                 surrogate=surrogate, evaluator=evaluator,
@@ -283,7 +277,6 @@ class APXPipeline:
             for _ in range(self.al_iterations):
                 if not loop.candidates: break
                 r = loop.iterate()
-                loop.candidates = [c for c in loop.candidates if c != r.chosen]
                 result.al_history.append({
                     "iteration": r.iteration, "chosen": r.chosen,
                     "predicted": r.predicted, "predicted_sd": r.predicted_sd,

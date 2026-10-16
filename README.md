@@ -36,11 +36,12 @@ ML models *are* the refined theory tφ. Not "models we use for prediction"
    DiffDock are all in there together.
 
 2. **They expose uncertainty.** `predict()` returns
-   `Prediction(value, uncertainty, meta)`. Uncertainty is required, not
-   optional. The UI cannot render an ML readout without an error bar
-   beside it. This is enforced by code shape (no `Optional` on
-   `uncertainty`) and by the right-hand panel's CSS — every readout is
-   `<value> ± <uncertainty>`.
+   `Prediction(value, uncertainty, meta)`. Every adapter is expected to
+   fill `uncertainty`; the UI cannot render an ML readout without an
+   error bar beside it — every readout in the right-hand panel is
+   `<value> ± <uncertainty>`. (The dataclass field itself still defaults
+   to `None`, so this is a convention checked by the unit tests, not by
+   the type system.)
 
 3. **They are updated by iteration `i`.** The active-learning loop
    (`PhiEx/al/loop.py`) is what advances the theory. Each `i ← i+1`
@@ -193,6 +194,7 @@ raising.
 ```
 make run            # FastAPI at http://localhost:8000, UI in browser
 make test           # apx_end_to_end sanity check
+make unit           # fast unit tests (pytest, no ML weights or network)
 ```
 
 ## Known simplifications and stubs (called out explicitly)
@@ -278,7 +280,7 @@ become a new field on `ComplexState` (e.g. `particles: tuple[Particle, ...]`).
 The simulator-shaped runner is `runners/readdy_simulator.py` mirroring
 `runners/simulator.py`.
 
-### Add a CUDA device branch in `device.py`
+### Add a CUDA device branch in `PhiEx/device.py`
 
 ```python
 def select_device(override=None):
@@ -317,7 +319,7 @@ The ticker is the producer side; the FastAPI SSE endpoint
 PhiEx/
 ├── environment.yml       authoritative conda spec (Mac MPS + Linux CPU)
 ├── Makefile              `make env`, `make weights`, `make run`, `make test`
-├── device.py             single source of truth for device selection
+├── device.py             shim re-exporting PhiEx/device.py
 ├── engine.py             scaffolding skeleton (the toy ϕ → ∃ demo)
 ├── index.html            scaffolding prototype (visual vocabulary)
 ├── README.md
@@ -327,7 +329,7 @@ PhiEx/
 │   └── main.py           FastAPI backend with SSE streaming
 ├── PhiEx/
 │   ├── __init__.py
-│   ├── device.py         re-export of root device.py
+│   ├── device.py         single source of truth for device selection
 │   ├── ticker.py         reasoning-ticker pub/sub
 │   ├── core/             State, Calculator, LearnedModel, Trajectory, FittedTheory
 │   ├── adapters/         pdb / esmfold / esm2 / foldseek / p2rank / vina /
