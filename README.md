@@ -106,15 +106,19 @@ What happens, in framework terms:
 6. **s∃ ⟳ tϕ active learning over a mutation panel.** Generate ~10–20
    single-point mutations of active-site residues. Seed the surrogate
    with five cheap evaluations. Then three iterations of "rank by UCB →
-   evaluate the top → refit". The UI's heatmap fills in. The loop
-   converges on a small set of residues whose mutations produced the
-   largest observed Δ.
+   evaluate the top → refit". The objective is effect magnitude |Δ|, for
+   both acquisition and the final ranking. The UI's heatmap fills in. The
+   loop converges on a small set of residues whose mutations produced the
+   largest observed |Δ|. Surrogate quality is reported out-of-sample:
+   prospective RMSE, leave-one-out R², and ±1σ coverage.
 
-7. **Cross-check.** Compare those residues against the residues
-   highlighted by ESM-2's last-layer attention (column-wise mean
-   importance — a documented heuristic). Where they agree, confidence
-   ↑; where they disagree, the residue is flagged in red as a discovery
-   candidate.
+7. **Cross-check.** Compare those residues (plus residues in contact
+   with the ligand) against the residues highlighted by ESM-2's
+   last-layer attention (column-wise mean importance — a documented
+   heuristic). Where they agree, confidence ↑. A residue the trajectory
+   flags but attention does not is marked in red as a discovery
+   candidate; attention-only residues are listed but not flagged. The
+   cross-check is skipped when ESM-2 runs as a stub.
 
 ## Architecture
 
@@ -209,6 +213,12 @@ do not bake them in elsewhere.
 * **Foldseek** is a stub for the APX example (canned plant-peroxidase
   hits). Replace `_predict_real` with a real `foldseek easy-search`
   call once the database is local.
+* **Trajectory analysis requires a matching atom layout.** Contacts,
+  RMSF and residence index frame positions in the order protein →
+  cofactors → ligands. The real OpenMM path builds its system from the
+  raw PDB text, so its atoms usually don't line up (waters in, docked
+  ligand out); analysis then reports "unavailable" rather than
+  mis-indexing.
 * **OpenMM heme parametrization** is the gap that most often forces the
   stub MD path on real hardware. Production heme parametrization
   requires GAFF or a custom XML; v0 falls back to a synthetic harmonic
@@ -226,8 +236,9 @@ do not bake them in elsewhere.
 * **ESM-2 attention probing** is a column-wise mean of the last-layer,
   mean-over-heads attention. Real attention probing per-head is
   post-v0.
-* **AL evaluator** in v0 is a cheap proxy: a MACE-region energy delta
-  perturbed by a BLOSUM-driven scalar. The interface
+* **AL evaluator** in v0 is a cheap proxy: a BLOSUM-driven |Δ| per
+  mutation, with the MACE-region ensemble σ as observation noise. The
+  structure is not mutated, so AL results reflect the proxy, not physics. The interface
   (`evaluator: dict -> (y, sigma)`) is the correct shape; production
   swaps in a real residence-time MD evaluator.
 

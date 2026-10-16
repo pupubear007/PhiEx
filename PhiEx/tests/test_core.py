@@ -207,3 +207,66 @@ def test_mace_forces_match_region_size():
     forces = mace.forces(state)
     assert len(forces) == 5
     assert mace.predict(state).uncertainty is not None
+
+
+# ────────────────────────────────────────────────────────────────────────
+# surrogate quality is reported out-of-sample
+# ────────────────────────────────────────────────────────────────────────
+
+def test_al_history_reports_prospective_and_loo_metrics():
+    seq = "ACDEFGHIKLMNPQRSTVWY" * 3
+    panel = generate_mutation_panel(list(range(1, 12)), seq, ["A", "K"])
+    loop = ActiveLearningLoop(surrogate=GBRSurrogate(sequence_length=len(seq)),
+                              evaluator=synthetic_evaluator)
+    loop.seed(panel[:4])
+    loop.set_candidates(panel[4:])
+    results = [loop.iterate() for _ in range(3)]
+    last = results[-1].to_json()
+    errs = [r.observed - r.predicted for r in results]
+    assert last["prospective_rmse"] == pytest.approx(
+        (sum(e * e for e in errs) / len(errs)) ** 0.5)
+    assert 0.0 <= last["coverage_1sigma"] <= 1.0
+    assert last["loo_r2"] is not None
+    # the in-sample fit is optimistic; LOO must not be better than it
+    assert last["loo_r2"] <= last["train_r2"] + 1e-9
+
+
+# ────────────────────────────────────────────────────────────────────────
+# shared working-structure fallback
+# ────────────────────────────────────────────────────────────────────────
+
+def test_resolve_working_structure_adopts_prediction_and_stub_heme():
+    from PhiEx.pipeline import resolve_working_structure
+    predicted = _toy_complex().protein
+    seq_only = Protein(name="exp", sequence=predicted.sequence)
+    protein, cofactors = resolve_working_structure(seq_only, [], predicted)
+    assert protein is predicted
+    assert len(cofactors) == 1 and cofactors[0].metadata.get("stub")
+
+
+def test_resolve_working_structure_keeps_experimental():
+    state = _toy_complex()
+    from PhiEx.pipeline import resolve_working_structure
+    protein, cofactors = resolve_working_structure(
+        state.protein, list(state.cofactors), predicted=None)
+    assert protein is state.protein
+    assert cofactors == list(state.cofactors)
+
+
+# ────────────────────────────────────────────────────────────────────────
+# analysis refuses frames whose atom layout doesn't match the state
+# ────────────────────────────────────────────────────────────────────────
+
+def test_analysis_unavailable_when_frames_miss_ligand():
+    from PhiEx.core.trajectory import Trajectory, Frame
+    from PhiEx.analysis import rmsf_per_residue, frames_match_topology
+    state = _toy_complex()
+    protein_only = tuple(a.xyz for a in state.protein.all_atoms())
+    traj = Trajectory(parent_state=state,
+                      frames=[Frame(step=i, time_ps=0.1 * i, positions=protein_only)
+                              for i in (1, 2)])
+    assert not frames_match_topology(traj)
+    assert ligand_residue_contacts(traj) == {}
+    assert rmsf_per_residue(traj) == {}
+    fe = state.cofactors[0].metal_atom.xyz
+    assert residence_time(traj, fe) is None

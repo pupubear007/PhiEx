@@ -127,7 +127,18 @@ SQLite file under `data/sessions/`.  Add a session picker to the UI.
 This makes "iteration i carries forward across days" an honest claim
 rather than a single-process artifact.
 
-## 13.  Docs site (separate)
+## 13.  Structure-based AL evaluator (★)
+
+The v0 stage-6 evaluator is a BLOSUM-driven proxy, so the AL loop's
+converged residues reflect a formula, not the enzyme.  A cheap first
+structural evaluator is an *in silico* alanine scan: for X→A, delete the
+side-chain atoms beyond Cβ in the active-site region and re-score that
+region with MACE; Δ = E(mutant region) − E(wild-type region), objective
+|Δ|.  It keeps the `evaluator: dict -> (y, sigma)` shape, so it is a
+swap inside `pipeline/apx.py` only.  Success criterion for the APX
+example: the loop recovers Trp41 / His42 without being told.
+
+## 14.  Docs site (separate)
 
 A small Vitepress / mdBook site that surfaces the framework essay
 (Wang 2025) alongside the engineering README.  The framework vocabulary

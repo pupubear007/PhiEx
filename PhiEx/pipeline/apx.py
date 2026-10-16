@@ -45,7 +45,8 @@ from ..adapters.mace import MACEAdapter, select_active_site_region
 from ..adapters.surrogate import GBRSurrogate, encode_perturbation
 from ..al import ActiveLearningLoop, UCBAcquisition, generate_mutation_panel
 from ..analysis import (ligand_residue_contacts, contact_frequency,
-                         rmsf_per_residue, residence_time)
+                         rmsf_per_residue, residence_time,
+                         frames_match_topology)
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -82,7 +83,7 @@ class APXPipelineResult:
     contacts: dict = field(default_factory=dict)
     top_contacts: list = field(default_factory=list)
     rmsf: dict = field(default_factory=dict)
-    residence_ps_near_heme_fe: float = 0.0
+    residence_ps_near_heme_fe: Optional[float] = None   # None = not computable
     mace_region_size: int = 0
     mace_energy_mean: Optional[float] = None
     mace_energy_sd: Optional[float] = None
@@ -94,7 +95,9 @@ class APXPipelineResult:
     # stage 7
     esm2_per_residue_importance: list = field(default_factory=list)
     agreement_residues: list = field(default_factory=list)
-    disagreement_residues: list = field(default_factory=list)
+    disagreement_residues: list = field(default_factory=list)   # trajectory-only
+    attention_only_residues: list = field(default_factory=list)  # reported, not flagged
+    cross_check_skipped: Optional[str] = None
 
     # bookkeeping
     theories: list = field(default_factory=list)
@@ -141,21 +144,7 @@ class APXPipeline:
                 log("phi", f"compared predicted vs experimental: Cα RMSD = {rmsd:.2f} Å"
                             if rmsd is not None else "RMSD: not computable")
 
-        # Architectural choice: if the experimental ϕ path returned a
-        # sequence-only stub (no residues), adopt the predicted ϕ as the
-        # working structure for stages 3–7.  README documents this.
-        if predicted is not None and not protein.residues and predicted.residues:
-            log("sys", "experimental structure absent — using ESMFold prediction as working ϕ")
-            protein = predicted
-        # If still no cofactor (offline first run, no PDB), synthesise a
-        # stub heme placed near the geometric centre of the structure so
-        # the cofactor-aware heuristics downstream have something to grip.
-        if protein.residues and not cofactors:
-            cofactors = [_synthesise_stub_heme(protein)]
-            log("sys", f"synthesised STUB heme cofactor at "
-                       f"({cofactors[0].metal_atom.xyz[0]:.1f}, "
-                       f"{cofactors[0].metal_atom.xyz[1]:.1f}, "
-                       f"{cofactors[0].metal_atom.xyz[2]:.1f})")
+        protein, cofactors = resolve_working_structure(protein, cofactors, predicted)
 
         # ── stage 2 ────────────────────────────────────────────────
         log("i", "── stage 2  s  function annotation ──")
@@ -231,11 +220,16 @@ class APXPipeline:
         result.top_contacts = contact_frequency(result.contacts, top_k=10)
         result.rmsf = rmsf_per_residue(traj)
         metal = next((c.metal_atom for c in cofactors if c.metal_atom), None)
-        if metal is not None:
-            result.residence_ps_near_heme_fe = residence_time(traj, metal.xyz, cutoff_a=6.0)
-            log("s", f"residence ascorbate near heme Fe: "
-                      f"{result.residence_ps_near_heme_fe:.2f} ps "
-                      f"({100*result.residence_ps_near_heme_fe/max(0.01, result.md_total_ps):.0f}% of trajectory)")
+        if not frames_match_topology(traj):
+            log("sys", "trajectory frames do not match the complex's atom layout "
+                       "(e.g. ligand absent from OpenMM system) — contacts, RMSF "
+                       "and residence unavailable")
+        elif metal is not None:
+            res_ps = residence_time(traj, metal.xyz, cutoff_a=6.0)
+            result.residence_ps_near_heme_fe = res_ps
+            if res_ps is not None:
+                log("s", f"residence ascorbate near heme Fe: {res_ps:.2f} ps "
+                          f"({100*res_ps/max(0.01, result.md_total_ps):.0f}% of trajectory)")
 
         # ── stage 6 ────────────────────────────────────────────────
         log("i", "── stage 6  s∃ ⟳ tϕ  active-learning loop ──")
@@ -255,6 +249,10 @@ class APXPipeline:
             base_pred = mace.predict(docked)
             base_sd = float(base_pred.uncertainty or 0.05)
 
+            # Objective: effect *magnitude* |Δ|.  The question stage 6 asks
+            # is "which residues matter", so UCB and the converged-residue
+            # ranking below must both look at |Δ| — optimising signed Δ
+            # while ranking by |Δ| had them chasing different targets.
             def evaluator(p: dict) -> tuple[float, float]:
                 resid = p.get("residue", 0)
                 if resid <= 0 or resid > len(protein.sequence):
@@ -264,7 +262,7 @@ class APXPipeline:
                 wt = p.get("from"); to = p.get("to")
                 blosum = _BLOSUM62.get((wt, to), 0)
                 delta = -0.3 * (5 - blosum) + 0.1 * math.sin(0.3 * resid)
-                return delta, base_sd
+                return abs(delta), base_sd
 
             loop = ActiveLearningLoop(
                 surrogate=surrogate, evaluator=evaluator,
@@ -277,16 +275,11 @@ class APXPipeline:
             for _ in range(self.al_iterations):
                 if not loop.candidates: break
                 r = loop.iterate()
-                result.al_history.append({
-                    "iteration": r.iteration, "chosen": r.chosen,
-                    "predicted": r.predicted, "predicted_sd": r.predicted_sd,
-                    "observed": r.observed, "observed_sd": r.observed_sd,
-                    "rmse": r.surrogate_rmse, "r2": r.surrogate_r2,
-                })
-            # converged residues = those whose mutations had observed magnitude
+                result.al_history.append(r.to_json())
+            # converged residues = those whose mutations had observed |Δ|
             # in the top quartile across the AL history
             magnitudes = sorted(
-                ((abs(h["observed"]), h["chosen"].get("residue"))
+                ((h["observed"], h["chosen"].get("residue"))
                  for h in result.al_history if h["chosen"].get("residue")),
                 reverse=True)
             cutoff = magnitudes[len(magnitudes)//4][0] if magnitudes else 0.0
@@ -298,21 +291,30 @@ class APXPipeline:
 
         # ── stage 7 ────────────────────────────────────────────────
         log("i", "── stage 7  s∃ ⟳ tϕ  cross-check ESM-2 attention ──")
-        if emb_pred is not None and emb_pred.value:
+        if emb_pred is not None and emb_pred.meta.get("stub"):
+            # stub attention is synthetic; comparing against it would only
+            # manufacture flags
+            result.cross_check_skipped = "ESM-2 running as stub"
+            log("sys", "cross-check skipped: ESM-2 is a stub, its attention is synthetic")
+        elif emb_pred is not None and emb_pred.value:
             attention = emb_pred.value.get("attention")
             importance = attention_residue_importance(attention)
             result.esm2_per_residue_importance = importance
             top_attn = sorted(range(len(importance)), key=lambda i: -importance[i])[:15]
-            top_attn_residues = sorted({i+1 for i in top_attn})  # 1-based
+            attn_residues = {i+1 for i in top_attn}                    # 1-based
             traj_residues = set(result.al_converged_residues) | \
-                            {r for r, _ in result.top_contacts[:10]}
-            agree = sorted(traj_residues & set(top_attn_residues))
-            disagree = sorted(traj_residues ^ set(top_attn_residues))
-            result.agreement_residues = agree
-            result.disagreement_residues = disagree
-            log("t", f"agreement (trajectory ∩ ESM-2 attention): {agree}")
-            if disagree:
-                log("s", f"discovery flag — disagreement at: {disagree}")
+                            {r for r, f in result.top_contacts[:10] if f > 0}
+            # agreement: both lines of evidence point at the residue.
+            # discovery flag: the simulation says it matters but sequence-level
+            # attention does not — the interesting, testable disagreement.
+            # Attention-only residues are reported but not flagged: top-15
+            # attention always yields 15 residues, most unrelated to the site.
+            result.agreement_residues = sorted(traj_residues & attn_residues)
+            result.disagreement_residues = sorted(traj_residues - attn_residues)
+            result.attention_only_residues = sorted(attn_residues - traj_residues)
+            log("t", f"agreement (trajectory ∩ ESM-2 attention): {result.agreement_residues}")
+            if result.disagreement_residues:
+                log("s", f"discovery flag — trajectory-only: {result.disagreement_residues}")
 
         # bookkeeping
         result.theories = [m.info() for m in THEORIES.all()]
@@ -345,6 +347,34 @@ def _pose_to_json(p) -> dict:
 
 def run_apx_pipeline(**kwargs) -> APXPipelineResult:
     return APXPipeline(**kwargs).run()
+
+
+# ────────────────────────────────────────────────────────────────────────
+# working-structure resolution (shared by the pipeline and the per-stage API)
+# ────────────────────────────────────────────────────────────────────────
+
+def resolve_working_structure(protein, cofactors, predicted=None):
+    """Pick the structure stages 3–7 operate on.
+
+    Architectural choice (README): if the experimental ϕ path returned a
+    sequence-only stub (no residues), adopt the predicted ϕ as the working
+    structure.  If there is still no cofactor (offline first run, no PDB),
+    synthesise a stub heme so the cofactor-aware heuristics downstream have
+    something to grip.
+
+    Returns (protein, cofactors).  Both `APXPipeline.run` and the FastAPI
+    per-stage routes call this so the two paths agree.
+    """
+    cofactors = list(cofactors)
+    if predicted is not None and not protein.residues and predicted.residues:
+        log("sys", "experimental structure absent — using ESMFold prediction as working ϕ")
+        protein = predicted
+    if protein.residues and not cofactors:
+        heme = _synthesise_stub_heme(protein)
+        cofactors = [heme]
+        x, y, z = heme.metal_atom.xyz
+        log("sys", f"synthesised STUB heme cofactor at ({x:.1f}, {y:.1f}, {z:.1f})")
+    return protein, cofactors
 
 
 # ────────────────────────────────────────────────────────────────────────

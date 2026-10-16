@@ -36,7 +36,8 @@ from pydantic import BaseModel
 from PhiEx.ticker import TICKER, log
 from PhiEx.device import select_device, describe_device, select_openmm_platform
 from PhiEx.core.theory import THEORIES
-from PhiEx.pipeline.apx import APXPipeline, APX_DEFAULT_PDB
+from PhiEx.pipeline.apx import (APXPipeline, APX_DEFAULT_PDB,
+                                resolve_working_structure)
 
 # adapters used by the per-stage routes
 from PhiEx.adapters.pdb import fetch_protein, parse_pdb_text, list_pdbs_for_uniprot
@@ -181,22 +182,19 @@ class StructureRequest(BaseModel):
 @app.post("/api/structure")
 def api_structure(req: StructureRequest):
     protein, cofactors, ann = fetch_protein(req.pdb_id, req.uniprot)
-    SESSION["protein"] = protein
-    SESSION["cofactors"] = cofactors
     SESSION["annotations"] = ann
     out: dict[str, Any] = {
         "experimental": _protein_summary(protein),
-        "cofactors": [{"name": c.name, "resname": c.resname,
-                       "metal": list(c.metal_atom.xyz) if c.metal_atom else None}
-                      for c in cofactors],
         "annotations": ann,
     }
+    predicted = None
     if req.run_esmfold and protein.sequence:
         esmfold = ESMFoldAdapter()
         if protein.residues:
             esmfold.set_reference(protein)
         THEORIES.register(esmfold)
         pred = esmfold.predict(protein.sequence)
+        predicted = pred.value
         SESSION["predicted"] = pred.value
         out["predicted"] = _protein_summary(pred.value)
         out["predicted"]["mean_plddt"] = pred.meta.get("mean_plddt")
@@ -205,6 +203,17 @@ def api_structure(req: StructureRequest):
         if protein.residues and pred.value.residues:
             out["rmsd_pred_vs_exp"] = ca_rmsd(pred.value, protein)
     out["experimental"]["pdb_text"] = protein.pdb_text
+
+    # same fallback as APXPipeline.run so the per-stage path and the
+    # one-shot pipeline operate on the same working structure
+    working, cofactors = resolve_working_structure(protein, cofactors, predicted)
+    SESSION["protein"] = working
+    SESSION["cofactors"] = cofactors
+    out["working_source"] = working.source
+    out["cofactors"] = [{"name": c.name, "resname": c.resname,
+                         "metal": list(c.metal_atom.xyz) if c.metal_atom else None,
+                         "stub": bool(c.metadata.get("stub", False))}
+                        for c in cofactors]
     return out
 
 
@@ -371,12 +380,7 @@ def api_al(req: ALRequest):
     for _ in range(req.n_iterations):
         if not loop.candidates: break
         r = loop.iterate()
-        history.append({
-            "iteration": r.iteration, "chosen": r.chosen,
-            "predicted": r.predicted, "predicted_sd": r.predicted_sd,
-            "observed": r.observed, "observed_sd": r.observed_sd,
-            "rmse": r.surrogate_rmse, "r2": r.surrogate_r2,
-        })
+        history.append(r.to_json())
     return {"history": history,
             "remaining_candidates": len(loop.candidates),
             "iteration": loop.iteration}

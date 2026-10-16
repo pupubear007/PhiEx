@@ -6,11 +6,12 @@ from __future__ import annotations
 import math
 
 from ..core.trajectory import Trajectory
+from .topology import frames_match_topology
 
 
 def rmsf_per_residue(traj: Trajectory) -> dict[int, float]:
     state = traj.parent_state
-    if not traj.frames or not state.protein.residues:
+    if not state.protein.residues or not frames_match_topology(traj):
         return {}
     # find Cα atom flat indices, in iteration order of all_atoms()
     ca_indices: dict[int, int] = {}
