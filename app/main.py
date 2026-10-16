@@ -201,6 +201,14 @@ class StructureRequest(BaseModel):
 @app.post("/api/structure")
 def api_structure(req: StructureRequest):
     protein, cofactors, ann = fetch_protein(req.pdb_id, req.uniprot)
+    if not protein.residues and protein.source == "unavailable":
+        # never leave the previous protein in place: every later stage would
+        # silently run on it while the UI shows the new accession
+        for k in ("protein", "cofactors", "uniprot", "site", "pockets", "active_pocket",
+                  "pose_contacts", "esm2_pred", "best_pose"):
+            SESSION.pop(k, None)
+        return JSONResponse({"error": f"no structure could be downloaded for {req.pdb_id} "
+                                      f"(UniProt {req.uniprot or '—'}); see the log"}, status_code=404)
     SESSION["annotations"] = ann
     out: dict[str, Any] = {
         "experimental": _protein_summary(protein),
@@ -228,8 +236,9 @@ def api_structure(req: StructureRequest):
     working, cofactors = resolve_working_structure(protein, cofactors, predicted)
     SESSION["protein"] = working
     acc = (req.uniprot or "").strip()
-    if ":" in req.pdb_id and req.pdb_id.split(":", 1)[0].upper() in ("AF", "AFILL", "SWISS"):
-        acc = req.pdb_id.split(":", 1)[1]
+    used = protein.name or req.pdb_id          # may differ: AFILL → AF fallback
+    if ":" in used and used.split(":", 1)[0].upper() in ("AF", "AFILL", "SWISS"):
+        acc = used.split(":", 1)[1]
     SESSION["uniprot"] = acc
     for k in ("site", "pockets", "active_pocket", "pose_contacts", "esm2_pred", "best_pose"):
         SESSION.pop(k, None)              # stale per-structure state

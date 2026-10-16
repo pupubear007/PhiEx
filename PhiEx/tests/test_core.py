@@ -861,3 +861,75 @@ def test_build_track_af_model(monkeypatch):
     assert "catalytic motifs" in names and names[-1] == "isolate variants"
     cat = next(x for x in t["tracks"] if x["name"] == "catalytic motifs")
     assert any(f["type"] == "catalytic" and f["start"] == 197 for f in cat["features"])
+
+
+# ── apo cofactor sites, AlphaFill fallback, failed loads ─────────────────
+
+def _a7f474(name="AF:A7F474"):
+    from pathlib import Path
+    from PhiEx.adapters.pdb import parse_pdb_text
+    return parse_pdb_text((Path(__file__).parent / "data" / "AF_A7F474.pdb").read_text(), name=name)
+
+
+def test_sam_motif_site_on_apo_model():
+    from PhiEx.analysis.site import site_from_cofactor_motif, detect_cofactor_motifs, _AA1_TO_3
+    from PhiEx.adapters.vina import default_ligand_for_site
+    prot, _ = _a7f474()
+    assert detect_cofactor_motifs(prot) == []
+    # graft a class-I MTase motif I (VLDVGCGVG) onto a well-ordered stretch
+    import dataclasses
+    graft = {60 + k: _AA1_TO_3[aa] for k, aa in enumerate("VLDVGCGVG")}
+    prot = dataclasses.replace(prot, residues=tuple(
+        dataclasses.replace(r, name=graft[r.index]) if r.index in graft else r for r in prot.residues))
+    site = site_from_cofactor_motif(prot)
+    assert site is not None and site.kind == "sam-methyltransferase"
+    assert site.source == "cofactor-motif" and site.residues[0] == 60
+    assert default_ligand_for_site(site).name == "S-adenosyl-L-methionine"
+
+
+def test_alphafill_missing_falls_back_to_alphafold(monkeypatch):
+    from PhiEx.adapters import pdb as pdbmod
+    from pathlib import Path
+    text = (Path(__file__).parent / "data" / "AF_A7F474.pdb").read_text()
+    calls = []
+    def fake_fetch(pid, cache_dir="data/pdb"):
+        calls.append(pid)
+        return None if pid.upper().startswith("AFILL:") else text
+    monkeypatch.setattr(pdbmod, "fetch_pdb_text", fake_fetch)
+    monkeypatch.setattr(pdbmod, "fetch_uniprot_annotations", lambda u: {})
+    prot, _, _ = pdbmod.fetch_protein("AFILL:A7F474", "A7F474")
+    assert calls == ["AFILL:A7F474", "AF:A7F474"]
+    assert prot.name == "AF:A7F474" and prot.residues
+
+
+def test_alphafill_status_unknown_is_not_a_model(monkeypatch):
+    import httpx
+    from PhiEx.adapters import pdb as pdbmod
+    class R:
+        def __init__(self, code, js): self.status_code, self._js = code, js
+        def json(self): return self._js
+    class C:
+        def __init__(self, *a, **k): pass
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def get(self, url, headers=None): return R(200, {"status": C.status})
+        def head(self, url, headers=None): return R(404, {})
+    monkeypatch.setattr(httpx, "Client", C)
+    C.status = "unknown"
+    assert pdbmod._alphafill_summary("A7EEE6") is None
+    C.status = "stored"
+    assert pdbmod._alphafill_summary("A7EEE6")["pdb_id"] == "AFILL:A7EEE6"
+
+
+def test_failed_structure_load_clears_session(monkeypatch):
+    from fastapi.testclient import TestClient
+    import app.main as m
+    from PhiEx.core.state import Protein
+    m.SESSION["protein"] = _a7f474()[0]
+    m.SESSION["uniprot"] = "OLD"
+    monkeypatch.setattr(m, "fetch_protein",
+                        lambda pid, uni: (Protein(name=pid, sequence="", source="unavailable"), [], {}))
+    c = TestClient(m.app)
+    r = c.post("/api/structure", json={"pdb_id": "AF:NOPE00", "uniprot": "NOPE00"})
+    assert r.status_code == 404 and "protein" not in m.SESSION and "uniprot" not in m.SESSION
+    assert c.get("/api/sequence-track").status_code == 400

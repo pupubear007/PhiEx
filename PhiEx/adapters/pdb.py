@@ -489,13 +489,23 @@ def _alphafill_summary(uniprot_id: str, timeout: float = 6.0) -> Optional[dict]:
     try:
         with httpx.Client(timeout=timeout, follow_redirects=True) as c:
             r = c.get(url, headers=headers)
+            status = None
             if r.status_code == 200:
+                try:
+                    status = str((r.json() or {}).get("status", "")).lower()
+                except Exception:
+                    status = None
+            # the status route answers 200 for every accession; only
+            # "stored"/"finished" means a model can actually be downloaded
+            if r.status_code == 200 and status in ("stored", "finished", "done", "available"):
                 return {
                     "pdb_id":     f"AFILL:{uniprot_id}",
                     "method":     "AlphaFill (cofactor-transplanted AF)",
                     "resolution": None,
                     "chains":     "",
                 }
+            if status:                       # "unknown", "queued", "error", …
+                return None
             # Some AlphaFill deployments return the model directly with no status route
             r = c.head(f"https://alphafill.eu/v1/aff/{uniprot_id}", headers=headers)
             if r.status_code == 200:
@@ -939,6 +949,13 @@ def fetch_protein(pdb_id: str = APX_DEFAULT_PDB,
     elif pdb_id.upper().startswith("SWISS:"):
         log("phi", f"SWISS-MODEL {pdb_id}: fetching from ExPASy…")
     pdb_text = fetch_pdb_text(pdb_id)
+    if pdb_text is None and pdb_id.upper().startswith(("AFILL:", "ALPHAFILL:")):
+        acc = pdb_id.split(":", 1)[1].strip().upper()
+        log("sys", f"AlphaFill has no model for {acc} — falling back to the plain AlphaFold "
+                   f"model (no transplanted cofactor; the site comes from motifs / pockets)")
+        pdb_id = f"AF:{acc}"
+        log("phi", f"AlphaFold {pdb_id}: fetching from EBI…")
+        pdb_text = fetch_pdb_text(pdb_id)
     annotations = fetch_uniprot_annotations(uniprot)
     if pdb_text is None:
         # Only fall back to the APX stub when the user is actually asking

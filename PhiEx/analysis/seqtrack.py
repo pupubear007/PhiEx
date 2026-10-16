@@ -182,6 +182,14 @@ def build_track(protein, uniprot: Optional[str] = None, site=None, active_pocket
     for m in re.finditer(r"HG[GA]", seq):
         feats.append({"start": resnums[m.start()], "end": resnums[m.end() - 1],
                       "label": f"HGG/HGA oxyanion-hole motif ({seq[m.start():m.end()]})", "type": "motif"})
+    try:
+        from .site import detect_cofactor_motifs
+        for h in detect_cofactor_motifs(protein, chain):
+            rr = h["residues"]
+            feats.append({"start": rr[0].index, "end": rr[-1].index,
+                          "label": f"{h['label']} ({h['text']}) → {h['cofactor']}", "type": "motif"})
+    except Exception:
+        pass
     for h in (catalytic_hits or [])[:3]:
         trio = [h.nucleophile, h.histidine] + ([h.acid] if h.acid else [])
         for r in trio:

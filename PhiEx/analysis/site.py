@@ -366,6 +366,68 @@ def site_from_catalytic(protein: Protein) -> Optional[ActiveSite]:
 
 
 # ────────────────────────────────────────────────────────────────────────
+# 3b. cofactor-binding sequence motifs (apo models: AlphaFold without the
+#     cofactor that AlphaFill would have transplanted)
+# ────────────────────────────────────────────────────────────────────────
+
+# (regex, kind, cofactor, label).  Ordered most specific first.
+_COFACTOR_MOTIFS = [
+    # class I (Rossmann-like) SAM-dependent methyltransferase motif I,
+    # the glycine-rich loop under the SAM carboxypropyl/adenine (e.g. VLDVGCGTG)
+    (r"[VILMFAC][VILMFACT][DE][VILMFAC]G[CSTAGNP]G[^P]G", "sam-methyltransferase", "SAM",
+     "SAM-binding motif I (hh(D/E)hGxGxG)"),
+    # dinucleotide-binding Rossmann β1-loop-αA: FAD / NAD(P) (GxGxxG/A)
+    (r"[VILAC][VILACFM][VILACG]G[AGS]G..G[AGLIVS]", "dinucleotide-binding", "NAD(P)/FAD",
+     "dinucleotide-binding motif (GxGxxG)"),
+]
+
+
+def detect_cofactor_motifs(protein: Protein, chain: Optional[str] = None) -> list[dict]:
+    res = chain_residues(protein, chain)
+    seq = "".join(_AA3.get(r.name, "X") for r in res)
+    hits = []
+    for rx, kind, cof, label in _COFACTOR_MOTIFS:
+        for m in re.finditer(rx, seq):
+            span = res[m.start():m.end()]
+            pl = [r.ca.bfactor for r in span if r.ca]
+            hits.append({"kind": kind, "cofactor": cof, "label": label, "residues": span,
+                         "text": m.group(0), "mean_b": (sum(pl) / len(pl)) if pl else None})
+    return hits
+
+
+def site_from_cofactor_motif(protein: Protein) -> Optional[ActiveSite]:
+    hits = detect_cofactor_motifs(protein)
+    if not hits:
+        return None
+    is_model = (protein.name or "").upper().startswith(("AF:", "AFILL:"))
+    if is_model:            # a motif in a disordered region is not a binding site
+        hits = [h for h in hits if h["mean_b"] is None or h["mean_b"] >= 70 or h["mean_b"] <= 1.0]
+        if not hits:
+            return None
+    h = hits[0]
+    span = h["residues"]
+    # the cofactor sits on the loop and the residues around it: use the loop
+    # plus every residue within 8 Å of its glycines as the site
+    glys = [r for r in span if r.name == "GLY" and r.ca] or [r for r in span if r.ca]
+    loop_c = _mean(r.ca.xyz for r in glys)
+    near = residues_near(protein, loop_c, 8.0, span[0].chain)
+    pts = [r.ca.xyz for r in chain_residues(protein, span[0].chain) if r.ca and r.index in set(near)]
+    center = _mean(pts) if pts else loop_c
+    first, last = span[0], span[-1]
+    notes = [f"{h['label']}: {h['text']} at {residue_label(first)}–{residue_label(last)}",
+             f"apo structure — the {h['cofactor']} pocket is inferred from the motif; dock "
+             f"{h['cofactor'].split('/')[0]} first to check it"]
+    if len(hits) > 1:
+        notes.append("other motif hits: " + "; ".join(
+            f"{x['text']} at {residue_label(x['residues'][0])}" for x in hits[1:3]))
+    return ActiveSite(center=center, source="cofactor-motif",
+                      label=f"{h['cofactor']} site (motif {residue_label(first)}–{residue_label(last)})",
+                      confidence="medium", kind=h["kind"],
+                      residues=tuple(r.index for r in span), chain=first.chain,
+                      notes=notes, cofactor=None)
+
+
+# ────────────────────────────────────────────────────────────────────────
 # 4/5. pocket and centroid fallbacks
 # ────────────────────────────────────────────────────────────────────────
 
@@ -397,7 +459,13 @@ def resolve_active_site(protein: Protein, cofactors: list[Cofactor],
     """Steps 1–3.  Returns None when only a pocket can decide (step 4)."""
     if anchor:
         return site_from_anchor(protein, anchor, cofactors)
-    return site_from_cofactors(protein, cofactors) or site_from_catalytic(protein)
+    site = site_from_cofactors(protein, cofactors)
+    if site:
+        return site
+    triad = site_from_catalytic(protein)
+    if triad and triad.confidence == "high":
+        return triad
+    return site_from_cofactor_motif(protein) or triad
 
 
 def choose_active_pocket(protein: Protein, pockets: list[Pocket],

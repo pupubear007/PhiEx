@@ -212,6 +212,9 @@ def triage_one(c: Candidate, dock: bool = False, exhaustiveness: int = 8) -> dic
         if not protein.residues:
             row["error"] = f"{struct_id}: structure download failed"
             return row
+        if protein.name and protein.name.upper() != struct_id.upper():
+            row["warnings"].append(f"{struct_id} unavailable — used {protein.name} (no transplanted cofactor)")
+            row["structure"], row["structure_kind"] = protein.name, "AlphaFold (AlphaFill unavailable)"
         protein, cofactors = resolve_working_structure(protein, cofactors, None)
         row["n_residues"] = len([r for r in protein.residues if r.chain == protein.residues[0].chain])
         het = {}
@@ -272,6 +275,10 @@ def triage_one(c: Candidate, dock: bool = False, exhaustiveness: int = 8) -> dic
 # a whole list, in a background thread
 # ────────────────────────────────────────────────────────────────────────
 
+# bump when site/structure logic changes so cached rows are recomputed
+TRIAGE_VERSION = 2
+
+
 def _cache_file() -> Path:
     return Path("data/candidates/triage_cache.json")
 
@@ -314,7 +321,7 @@ class TriageJob:
                 if self.stop_requested:
                     log("sys", "candidate triage stopped by user")
                     break
-                key = f"{c.gene_id}|dock={int(self.dock)}|ex={self.exhaustiveness}"
+                key = f"{c.gene_id}|dock={int(self.dock)}|ex={self.exhaustiveness}|v={TRIAGE_VERSION}"
                 row = cache.get(key) if self.use_cache else None
                 if row is None:
                     row = triage_one(c, dock=self.dock, exhaustiveness=self.exhaustiveness)

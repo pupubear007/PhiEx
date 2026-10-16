@@ -283,6 +283,10 @@ async function runStructure() {
   try {
     const r = await postJSON("/api/structure", {pdb_id: pdb, uniprot: uni, run_esmfold: true});
     lastStruct = r;
+    if (r.experimental && r.experimental.name && r.experimental.name.toUpperCase() !== pdb.toUpperCase()) {
+      logSys(`⚠ ${pdb} unavailable — loaded ${r.experimental.name} instead`);
+      $("#i-pdb").value = r.experimental.name;
+    }
     if (r.predicted && r.predicted.pdb_text) {
       await loadPredictedWithPlddt(r.predicted.pdb_text);
       $("#v-plddt").textContent = (r.predicted.mean_plddt||0).toFixed(1)
@@ -298,7 +302,13 @@ async function runStructure() {
       `active site: <b>—</b>`;
     residueLabels = r.residue_labels || {};
     refreshSequence(true);
-  } catch(e){ alert("structure: "+e.message); }
+    return true;
+  } catch(e){
+    logSys(`structure: ${e.message}`);
+    refreshSequence();                 // clears the strip instead of showing the old protein
+    alert("structure: "+e.message);
+    return false;
+  }
 }
 $("#run-structure").addEventListener("click", () => runStructure());
 
@@ -1023,7 +1033,7 @@ async function openCandidate(r){
   logSys(`opening ${r.gene_id} (${r.class_title}) — ${r.structure}`);
   if (r.note) logSys(`note: ${r.note}`);
   (r.warnings||[]).forEach(w => logSys(`⚠ ${r.gene_id}: ${w}`));
-  await runStructure();
+  if (!(await runStructure())) return;
   await runPockets();
   if (r.screen) renderScreen({rows: r.screen, n_ok: r.screen.filter(x=>!x.error).length,
                               n_failed: r.screen.filter(x=>x.error).length, seconds: "cached",
@@ -1059,7 +1069,14 @@ $("#seq-pae").addEventListener("click", () => togglePae());
 async function refreshSequence(open=false){
   try {
     const r = await fetch("/api/sequence-track");
-    if (!r.ok) return;
+    if (!r.ok) {
+      SEQ.data = null; SEQ.pae = null;
+      $("#seq-title").textContent = "no structure loaded";
+      $("#seq-legend").innerHTML = ""; $("#seq-scroll").innerHTML = "";
+      const lab = document.getElementById("seq-labels"); if (lab) lab.innerHTML = "";
+      $("#pae-box").classList.remove("on");
+      return;
+    }
     SEQ.data = await r.json();
     SEQ.sel = null;
     renderSequence();

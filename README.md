@@ -188,6 +188,11 @@ make weights   # now also builds the Foldseek PDB database under models/foldseek
 make run       # registry panel: foldseek / p2rank without the STUB tag
 ```
 
+When a candidate asks for AlphaFill (cofactor transplant) and AlphaFill has
+no model for that accession, PhiEx loads the plain AlphaFold model instead,
+says so in the log and the triage warnings, and finds the cofactor site from
+sequence motifs (row 3b above).
+
 Check by hand with `foldseek version` and `prank -v`.  A different P2Rank
 release: `P2RANK_VERSION=2.5 make tools`.
 
@@ -229,6 +234,7 @@ MACE region, mutation panel, discovery flags — is built around that site.
 | 1 | **your anchor** — the *Site anchor* box / `anchor` API field, e.g. `S197,H351,E314`, `Ser197`, `A:197` | always wins | `user` |
 | 2 | **real cofactor** in the structure (heme Fe, FAD, NAD …) | crystal structures with HETATM cofactors | `high` |
 | 3 | **catalytic triad/dyad** found geometrically: Ser/Cys–His–Asp/Glu hydrogen-bond network (≤ 3.6 Å), boosted by a G‑x‑S‑x‑G nucleophile-elbow motif | serine / cysteine hydrolases, esterases, lipases, proteases | `high` with motif + acid, else `medium` |
+| 3b | **cofactor-binding motif** in an apo model (AlphaFold without the cofactor): class-I SAM methyltransferase motif I `hh(D/E)hGxGxG`, Rossmann dinucleotide loop `GxGxxG` (NAD(P)/FAD); motif must be ordered (pLDDT ≥ 70). A medium-confidence triad without the G-x-S-x-G motif ranks below this | SAM methyltransferases (ERG6 …), FAD/NAD(P) oxidoreductases when AlphaFill has no model; default probe for a SAM site is SAM itself | `medium` |
 | 4 | **top P2Rank pocket** | nothing above found | `medium` (`low` with the geometric fallback) |
 | 5 | protein centroid | nothing at all | `low` |
 

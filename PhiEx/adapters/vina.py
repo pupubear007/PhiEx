@@ -174,17 +174,26 @@ PNP_ACETATE = Ligand(
     metadata={"role": "model ester substrate (esterase assay)"},
 )
 
+SAM = Ligand(
+    name="S-adenosyl-L-methionine",
+    smiles="C[S+](CC[C@H]([NH3+])C(=O)[O-])C[C@H]1O[C@@H](n2cnc3c(N)ncnc32)[C@H](O)[C@@H]1O",
+    metadata={"role": "methyl-donor cofactor (checks the motif-inferred SAM pocket)"},
+)
+
 
 def default_ligand_for_site(site) -> "Ligand | None":
     """Default substrate when the user gives no SMILES — only where the
     site itself says what a reasonable probe is:
         serine/cysteine hydrolase → p-nitrophenyl acetate (esterase assay)
         heme site                 → ascorbate (the APX reducing substrate)
+        SAM motif site (apo)      → SAM itself, to check the inferred pocket
     Anything else returns None: docking an arbitrary molecule into an
     unknown site produces numbers that look meaningful and are not."""
     kind = getattr(site, "kind", "") or ""
     if kind in ("serine-hydrolase", "cysteine-hydrolase"):
         return PNP_ACETATE
+    if kind == "sam-methyltransferase":
+        return SAM
     if kind == "ligand-site" and getattr(site, "bound_ligand", None):
         lig = ligand_from_chem_comp(site.bound_ligand)
         if lig is not None:
