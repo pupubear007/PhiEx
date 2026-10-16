@@ -47,47 +47,53 @@ def select_active_site_region(state: ComplexState,
     """Pick the active-site atom subset for ML/MM.
 
     Heuristic (documented in README):
-        1. all cofactor atoms (heme: ~43 atoms — already near the cap)
-        2. all ligand atoms (ascorbate: 12 heavy atoms)
-        3. nearest residues by Cα distance to the cofactor metal,
-           one residue at a time, until max_atoms is reached.
+        1. ligand atoms (the docked substrate)
+        2. cofactor atoms near the site centre
+        3. nearest residues by Cα distance to the site centre, one residue
+           at a time, until max_atoms is reached.
+    Only elements MACE-OFF23 was trained on (H C N O F P S Cl Br I) are
+    kept — a heme Fe would make the model fail and silently fall back.
+    The site centre is `state.metadata["site_center"]` (set by the
+    pipeline from analysis/site.py), else the first cofactor metal.
     """
     region: list[Atom] = []
+    center = state.metadata.get("site_center")
+    if center is None:
+        metal = next((c.metal_atom for c in state.cofactors if c.metal_atom), None)
+        center = metal.xyz if metal else None
 
-    # cofactors first
-    metal: Optional[Atom] = None
-    for c in state.cofactors:
-        for a in c.atoms:
-            region.append(a)
-            if len(region) >= max_atoms:
-                return region[:max_atoms]
-        if c.metal_atom and metal is None:
-            metal = c.metal_atom
+    def _ok(a: Atom) -> bool:
+        return a.element.upper() in _MACE_OFF_ELEMENTS
 
-    # ligands
     for L in state.ligands:
         for a in L.atoms:
-            region.append(a)
-            if len(region) >= max_atoms:
-                return region[:max_atoms]
+            if _ok(a):
+                region.append(a)
+    for c in state.cofactors:
+        if center is not None and c.atoms and \
+                min(math.dist(a.xyz, center) for a in c.atoms) > 6.0:
+            continue
+        region.extend(a for a in c.atoms if _ok(a))
+    if len(region) >= max_atoms:
+        return region[:max_atoms]
 
-    if metal is None or not state.protein.residues:
+    if center is None or not state.protein.residues:
         return region[:max_atoms]
 
     # nearest residues
     by_dist = []
     for r in state.protein.residues:
         if r.ca is None: continue
-        d = math.sqrt((r.ca.xyz[0]-metal.xyz[0])**2 +
-                      (r.ca.xyz[1]-metal.xyz[1])**2 +
-                      (r.ca.xyz[2]-metal.xyz[2])**2)
-        by_dist.append((d, r))
+        by_dist.append((math.dist(r.ca.xyz, center), r))
     by_dist.sort(key=lambda x: x[0])
     for d, r in by_dist:
         room = max_atoms - len(region)
         if room <= 0: break
-        region.extend(r.atoms[:room])
+        region.extend([a for a in r.atoms if _ok(a)][:room])
     return region[:max_atoms]
+
+
+_MACE_OFF_ELEMENTS = {"H", "C", "N", "O", "F", "P", "S", "CL", "BR", "I"}
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -187,13 +193,14 @@ class MACEAdapter(LearnedModelBase):
         rng = random.Random(42 ^ len(region))
         # synthetic energy: rough harmonic in distance to cofactor metal,
         # so deformations register as "higher energy"
-        metal = next((c.metal_atom for c in state.cofactors if c.metal_atom), None)
-        if metal:
+        center = state.metadata.get("site_center")
+        if center is None:
+            metal = next((c.metal_atom for c in state.cofactors if c.metal_atom), None)
+            center = metal.xyz if metal else None
+        if center is not None:
             disp_sum = 0.0
             for a in region:
-                d = math.sqrt((a.xyz[0]-metal.xyz[0])**2 +
-                              (a.xyz[1]-metal.xyz[1])**2 +
-                              (a.xyz[2]-metal.xyz[2])**2)
+                d = math.dist(a.xyz, center)
                 disp_sum += (d - 4.0) ** 2
             energy = -8.0 + 0.001 * disp_sum + rng.gauss(0, 0.02)
         else:

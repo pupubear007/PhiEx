@@ -35,10 +35,10 @@ from ..core.theory import THEORIES, FittedTheory
 from ..adapters.pdb import (fetch_protein, APX_DEFAULT_PDB,
                              APX_DEFAULT_UNIPROT)
 from ..adapters.esmfold import ESMFoldAdapter, ca_rmsd
-from ..adapters.esm2 import ESM2Adapter, attention_residue_importance
+from ..adapters.esm2 import ESM2Adapter, attention_residue_importance, mutation_llr
 from ..adapters.foldseek import FoldseekAdapter, aggregate_go_terms
 from ..adapters.p2rank import P2RankAdapter
-from ..adapters.vina import VinaAdapter, ASCORBATE
+from ..adapters.vina import VinaAdapter, ASCORBATE, default_ligand_for_site
 from ..adapters.diffdock import DiffDockAdapter
 from ..adapters.openmm_calc import OpenMMSimulator
 from ..adapters.mace import MACEAdapter, select_active_site_region
@@ -47,6 +47,8 @@ from ..al import ActiveLearningLoop, UCBAcquisition, generate_mutation_panel
 from ..analysis import (ligand_residue_contacts, contact_frequency,
                          rmsf_per_residue, residence_time,
                          frames_match_topology)
+from ..analysis.site import (ActiveSite, resolve_active_site, choose_active_pocket,
+                             chain_residues, functional_point)
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -72,9 +74,12 @@ class APXPipelineResult:
     # stage 3
     pockets: list = field(default_factory=list)        # serialisable dicts
     active_site_id: Optional[str] = None
+    site: dict = field(default_factory=dict)            # ActiveSite.to_json()
 
     # stage 4
+    ligand: dict = field(default_factory=dict)          # {"name", "smiles", "default"}
     poses: list = field(default_factory=list)
+    pose_contacts: list = field(default_factory=list)   # residues ≤ 4 Å of best pose
 
     # stage 5
     n_md_frames: int = 0
@@ -83,7 +88,8 @@ class APXPipelineResult:
     contacts: dict = field(default_factory=dict)
     top_contacts: list = field(default_factory=list)
     rmsf: dict = field(default_factory=dict)
-    residence_ps_near_heme_fe: Optional[float] = None   # None = not computable
+    residence_ps_near_site: Optional[float] = None      # None = not computable
+    residence_ps_near_heme_fe: Optional[float] = None   # legacy alias of the above
     mace_region_size: int = 0
     mace_energy_mean: Optional[float] = None
     mace_energy_sd: Optional[float] = None
@@ -91,6 +97,7 @@ class APXPipelineResult:
     # stage 6
     al_history: list = field(default_factory=list)
     al_converged_residues: list = field(default_factory=list)
+    al_scoring: str = ""                                # what "observed" means
 
     # stage 7
     esm2_per_residue_importance: list = field(default_factory=list)
@@ -98,6 +105,7 @@ class APXPipelineResult:
     disagreement_residues: list = field(default_factory=list)   # trajectory-only
     attention_only_residues: list = field(default_factory=list)  # reported, not flagged
     cross_check_skipped: Optional[str] = None
+    residue_labels: dict = field(default_factory=dict)  # resseq → "Ser197"
 
     # bookkeeping
     theories: list = field(default_factory=list)
@@ -114,6 +122,9 @@ class APXPipeline:
     md_total_ps: float = 10.0
     al_iterations: int = 3
     use_diffdock: bool = False
+    anchor: Optional[str] = None          # e.g. "S197,H351,E314"; None = auto
+    ligand_smiles: Optional[str] = None   # None = default for the site type
+    ligand_name: str = ""
 
     def run(self) -> APXPipelineResult:
         result = APXPipelineResult(experimental_pdb_id=self.pdb_id)
@@ -150,7 +161,8 @@ class APXPipeline:
         log("i", "── stage 2  s  function annotation ──")
         esm2 = ESM2Adapter()
         THEORIES.register(esm2)
-        emb_pred = esm2.predict(protein.sequence) if protein.sequence else None
+        chain_res, chain_seq = working_chain(protein)
+        emb_pred = esm2.predict(chain_seq) if chain_seq else None
         if emb_pred is not None:
             result.esm2_embedding_sd = float(emb_pred.uncertainty or 0.0)
 
@@ -165,13 +177,18 @@ class APXPipeline:
         # ── stage 3 ────────────────────────────────────────────────
         log("i", "── stage 3  ∃  pocket detection ──")
         # form a ComplexState now that we have cofactors
+        site = resolve_active_site(protein, cofactors, self.anchor)
         state = ComplexState(protein=protein, cofactors=tuple(cofactors))
         p2 = P2RankAdapter()
         THEORIES.register(p2)
         pocket_pred = p2.predict(state)
-        pockets: list[Pocket] = pocket_pred.value
+        active, site, pockets = choose_active_pocket(
+            protein, pocket_pred.value, site, real_detector=not p2.is_stub)
+        log_site(site, active)
+        state = ComplexState(protein=protein, cofactors=tuple(cofactors),
+                             metadata={"site_center": site.center})
+        result.site = site.to_json()
         result.pockets = [_pocket_to_json(p) for p in pockets]
-        active = next((p for p in pockets if p.is_active_site), pockets[0] if pockets else None)
         result.active_site_id = active.id if active else None
 
         # ── stage 4 ────────────────────────────────────────────────
@@ -180,7 +197,9 @@ class APXPipeline:
             log("sys", "no pocket — skipping docking")
             poses = []
         else:
-            ligand = ASCORBATE
+            ligand = pick_ligand(site, self.ligand_smiles, self.ligand_name)
+            result.ligand = {"name": ligand.name, "smiles": ligand.smiles,
+                             "default": not self.ligand_smiles}
             if self.use_diffdock:
                 dd = DiffDockAdapter()
                 THEORIES.register(dd)
@@ -189,18 +208,23 @@ class APXPipeline:
                 vina = VinaAdapter()
                 poses = vina.dock(state, ligand, active)
         result.poses = [_pose_to_json(p) for p in poses]
+        if poses and not poses[0].ligand.metadata.get("stub", False):
+            result.pose_contacts = pose_contact_residues(protein, poses[0], site.chain)
+            if result.pose_contacts:
+                log("s", f"best pose contacts (≤ 4 Å): {result.pose_contacts}")
 
         # form the docked complex from the best pose
         docked = state
         if poses:
             best = poses[0]
             docked = ComplexState(protein=protein, cofactors=tuple(cofactors),
-                                  ligands=(best.ligand,))
+                                  ligands=(best.ligand,),
+                                  metadata={"site_center": site.center})
 
         # ── stage 5 ────────────────────────────────────────────────
         log("i", "── stage 5  ϕ → ∃  short ML/MM dynamics ──")
         sim = OpenMMSimulator(total_ps=self.md_total_ps)
-        traj = sim.run(docked, label="APX-ascorbate")
+        traj = sim.run(docked, label=f"{protein.name}-{result.ligand.get('name', 'apo')}")
         result.n_md_frames = len(traj.frames)
         result.md_total_ps = traj.frames[-1].time_ps if traj.frames else 0.0
         result.energies_ev = [f.energy_ev for f in traj.frames]
@@ -219,50 +243,38 @@ class APXPipeline:
         result.contacts = ligand_residue_contacts(traj)
         result.top_contacts = contact_frequency(result.contacts, top_k=10)
         result.rmsf = rmsf_per_residue(traj)
-        metal = next((c.metal_atom for c in cofactors if c.metal_atom), None)
+        ligand_simulated = traj.metadata.get("ligand_simulated", True)
         if not frames_match_topology(traj):
             log("sys", "trajectory frames do not match the complex's atom layout "
                        "(e.g. ligand absent from OpenMM system) — contacts, RMSF "
                        "and residence unavailable")
-        elif metal is not None:
-            res_ps = residence_time(traj, metal.xyz, cutoff_a=6.0)
+        elif not ligand_simulated:
+            log("sys", "residence time not computed: the ligand has no MD parameters "
+                       "in v0 and was held at its docked pose (protein-only MD)")
+        else:
+            res_ps = residence_time(traj, site.center, cutoff_a=6.0)
+            result.residence_ps_near_site = res_ps
             result.residence_ps_near_heme_fe = res_ps
             if res_ps is not None:
-                log("s", f"residence ascorbate near heme Fe: {res_ps:.2f} ps "
-                          f"({100*res_ps/max(0.01, result.md_total_ps):.0f}% of trajectory)")
+                log("s", f"residence of {result.ligand.get('name', 'ligand')} within 6 Å of "
+                         f"{site.label}: {res_ps:.2f} ps "
+                         f"({100*res_ps/max(0.01, result.md_total_ps):.0f}% of trajectory)")
 
         # ── stage 6 ────────────────────────────────────────────────
         log("i", "── stage 6  s∃ ⟳ tϕ  active-learning loop ──")
-        active_residues = list(active.nearby_residues) if active else []
-        panel = generate_mutation_panel(active_residues[:8], protein.sequence,
-                                        substitutions=["A", "K"])
-        log("t", f"AL panel size: {len(panel)} candidates over {len(active_residues)} active-site residues")
+        active_residues = rank_site_residues(protein, active, site, limit=10)
+        residue_aa = {r.index: _AA1.get(r.name.upper(), "X") for r in chain_res}
+        panel = generate_mutation_panel(active_residues, protein.sequence,
+                                        substitutions=["A", "K"],
+                                        residue_aa=residue_aa)
+        log("t", f"AL panel size: {len(panel)} candidates over {len(active_residues)} "
+                 f"site residues nearest {site.label}")
         if panel:
-            surrogate = GBRSurrogate(sequence_length=max(1, len(protein.sequence)))
+            surrogate = GBRSurrogate(sequence_length=max(1, len(chain_seq)))
             THEORIES.register(surrogate)
-
-            # The v0 evaluator is a cheap proxy (README "Known simplifications").
-            # We don't actually mutate the structure in v0, so the MACE
-            # energy of the docked complex is the same for every candidate:
-            # evaluate it once and use its ensemble σ as the observation noise.
-            from ..adapters.surrogate import _BLOSUM62
-            base_pred = mace.predict(docked)
-            base_sd = float(base_pred.uncertainty or 0.05)
-
-            # Objective: effect *magnitude* |Δ|.  The question stage 6 asks
-            # is "which residues matter", so UCB and the converged-residue
-            # ranking below must both look at |Δ| — optimising signed Δ
-            # while ranking by |Δ| had them chasing different targets.
-            def evaluator(p: dict) -> tuple[float, float]:
-                resid = p.get("residue", 0)
-                if resid <= 0 or resid > len(protein.sequence):
-                    return 0.0, 1.0
-                # synthetic mutation effect (heuristic, called out in README):
-                # penalise mutations of conserved residues by their BLOSUM score
-                wt = p.get("from"); to = p.get("to")
-                blosum = _BLOSUM62.get((wt, to), 0)
-                delta = -0.3 * (5 - blosum) + 0.1 * math.sin(0.3 * resid)
-                return abs(delta), base_sd
+            evaluator, result.al_scoring = build_mutation_evaluator(
+                emb_pred, chain_res, mace, docked)
+            log("t", f"AL objective: {result.al_scoring}")
 
             loop = ActiveLearningLoop(
                 surrogate=surrogate, evaluator=evaluator,
@@ -301,9 +313,10 @@ class APXPipeline:
             importance = attention_residue_importance(attention)
             result.esm2_per_residue_importance = importance
             top_attn = sorted(range(len(importance)), key=lambda i: -importance[i])[:15]
-            attn_residues = {i+1 for i in top_attn}                    # 1-based
+            attn_residues = {chain_res[i].index for i in top_attn if i < len(chain_res)}
             traj_residues = set(result.al_converged_residues) | \
-                            {r for r, f in result.top_contacts[:10] if f > 0}
+                            {r for r, f in result.top_contacts[:10] if f > 0} | \
+                            set(result.pose_contacts)
             # agreement: both lines of evidence point at the residue.
             # discovery flag: the simulation says it matters but sequence-level
             # attention does not — the interesting, testable disagreement.
@@ -317,6 +330,7 @@ class APXPipeline:
                 log("s", f"discovery flag — trajectory-only: {result.disagreement_residues}")
 
         # bookkeeping
+        result.residue_labels = {r.index: f"{r.name.title()}{r.index}" for r in chain_res}
         result.theories = [m.info() for m in THEORIES.all()]
         log("i", "── pipeline complete ──")
         return result
@@ -356,29 +370,121 @@ def run_apx_pipeline(**kwargs) -> APXPipelineResult:
 def resolve_working_structure(protein, cofactors, predicted=None):
     """Pick the structure stages 3–7 operate on.
 
-    Architectural choice (README): if the experimental ϕ path returned a
-    sequence-only stub (no residues), adopt the predicted ϕ as the working
-    structure.  If there is still no cofactor (offline first run, no PDB),
-    synthesise a stub heme so the cofactor-aware heuristics downstream have
-    something to grip.
+    If the experimental ϕ path returned a sequence-only stub (no residues),
+    adopt the predicted ϕ as the working structure.  Cofactors are passed
+    through untouched: a protein without a cofactor gets none.  (v0 used to
+    synthesise a heme here, anchored at APX's His42, which put every
+    downstream stage in the wrong place for any non-APX protein.  The
+    active site is now resolved explicitly — see analysis/site.py.)
 
     Returns (protein, cofactors).  Both `APXPipeline.run` and the FastAPI
     per-stage routes call this so the two paths agree.
     """
-    cofactors = list(cofactors)
+    cofactors = [c for c in cofactors if not c.metadata.get("stub")]
     if predicted is not None and not protein.residues and predicted.residues:
         log("sys", "experimental structure absent — using ESMFold prediction as working ϕ")
         protein = predicted
-    if protein.residues and not cofactors:
-        heme = _synthesise_stub_heme(protein)
-        cofactors = [heme]
-        x, y, z = heme.metal_atom.xyz
-        log("sys", f"synthesised STUB heme cofactor at ({x:.1f}, {y:.1f}, {z:.1f})")
     return protein, cofactors
 
 
 # ────────────────────────────────────────────────────────────────────────
-# stub heme synthesis (offline first-run fallback)
+# shared stage helpers (pipeline + FastAPI routes)
+# ────────────────────────────────────────────────────────────────────────
+
+_AA1 = {"ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C", "GLN": "Q",
+        "GLU": "E", "GLY": "G", "HIS": "H", "ILE": "I", "LEU": "L", "LYS": "K",
+        "MET": "M", "PHE": "F", "PRO": "P", "SER": "S", "THR": "T", "TRP": "W",
+        "TYR": "Y", "VAL": "V"}
+
+
+def working_chain(protein) -> "tuple[list, str]":
+    """Residues and one-letter sequence of the chain the analysis follows
+    (the first chain).  Sequence-only proteins return ([], sequence)."""
+    res = chain_residues(protein)
+    if not res:
+        return [], protein.sequence or ""
+    return res, "".join(_AA1.get(r.name.upper(), "X") for r in res)
+
+
+def log_site(site: ActiveSite, pocket) -> None:
+    log("phi", f"active site: {site.label}  [source={site.source}, "
+               f"confidence={site.confidence}] → pocket {pocket.id if pocket else '—'}")
+    for n in site.notes:
+        log("sys", f"site note: {n}")
+
+
+def pick_ligand(site: Optional[ActiveSite], smiles: Optional[str], name: str = "") -> Ligand:
+    if smiles:
+        return Ligand(name=name or "ligand", smiles=smiles)
+    lig = default_ligand_for_site(site)
+    log("sys", f"no ligand SMILES given — using default for a "
+               f"{getattr(site, 'kind', 'unknown')} site: {lig.name}")
+    return lig
+
+
+def pose_contact_residues(protein, pose, chain=None, cutoff: float = 4.0) -> list:
+    atoms = [a.xyz for a in pose.ligand.atoms]
+    out = set()
+    for r in protein.residues:
+        if chain is not None and r.chain != chain:
+            continue
+        if any(math.dist(a.xyz, l) <= cutoff for a in r.atoms for l in atoms):
+            out.add(r.index)
+    return sorted(out)
+
+
+def rank_site_residues(protein, pocket, site: ActiveSite, limit: int = 10) -> list:
+    """Pocket residues ordered by distance of their functional atoms to the
+    site centre — the old path took the first 8 by residue *number*."""
+    if pocket is None:
+        return []
+    by_idx = {r.index: r for r in chain_residues(protein, site.chain)}
+    scored = []
+    for i in pocket.nearby_residues:
+        r = by_idx.get(i)
+        if r is not None:
+            scored.append((math.dist(functional_point(r), site.center), i))
+    return [i for _, i in sorted(scored)[:limit]]
+
+
+def build_mutation_evaluator(emb_pred, chain_res, mace, docked):
+    """Return (evaluator, description).
+
+    Real path: ESM-2 zero-shot mutation effect — observed = −LLR
+    (log p(wt) − log p(mut)); larger = the language model finds the
+    mutation more disruptive.  This is a published, cheap variant-effect
+    score; it does NOT model ligand binding.
+    Fallback (ESM-2 stub): the v0 BLOSUM heuristic, labelled synthetic.
+    """
+    from ..adapters.surrogate import _BLOSUM62
+    pos_of = {r.index: i + 1 for i, r in enumerate(chain_res)}
+    logprobs = None
+    if emb_pred is not None and not emb_pred.meta.get("stub"):
+        logprobs = (emb_pred.value or {}).get("aa_logprobs")
+
+    if logprobs is not None:
+        def evaluator(p: dict) -> "tuple[float, float]":
+            pos = pos_of.get(p.get("residue", 0))
+            llr = mutation_llr(logprobs, pos, p.get("from", "X"), p.get("to", "X")) if pos else None
+            if llr is None:
+                return 0.0, 1.0
+            return -llr, 0.25
+        return evaluator, "ESM-2 zero-shot mutation effect (−LLR, nats; larger = more disruptive)"
+
+    base_pred = mace.predict(docked)
+    base_sd = float(base_pred.uncertainty or 0.05)
+
+    def evaluator(p: dict) -> "tuple[float, float]":
+        resid = p.get("residue", 0)
+        wt = p.get("from"); to = p.get("to")
+        blosum = _BLOSUM62.get((wt, to), 0)
+        delta = -0.3 * (5 - blosum) + 0.1 * math.sin(0.3 * resid)
+        return abs(delta), base_sd
+    return evaluator, "SYNTHETIC BLOSUM heuristic (ESM-2 is a stub) — not a real measurement"
+
+
+# ────────────────────────────────────────────────────────────────────────
+# legacy stub heme (kept for the offline tests; no longer used by the pipeline)
 # ────────────────────────────────────────────────────────────────────────
 
 def _synthesise_stub_heme(protein):

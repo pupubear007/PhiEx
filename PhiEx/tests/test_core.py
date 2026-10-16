@@ -13,7 +13,7 @@ import threading
 
 import pytest
 
-from PhiEx.core.state import Atom, Residue, Protein, Cofactor, Ligand, ComplexState
+from PhiEx.core.state import Atom, Residue, Protein, Cofactor, Ligand, ComplexState, Pocket
 from PhiEx.core.learned import Prediction
 from PhiEx.ticker import Ticker
 from PhiEx.al import (ActiveLearningLoop, ThompsonAcquisition, UCBAcquisition,
@@ -235,13 +235,13 @@ def test_al_history_reports_prospective_and_loo_metrics():
 # shared working-structure fallback
 # ────────────────────────────────────────────────────────────────────────
 
-def test_resolve_working_structure_adopts_prediction_and_stub_heme():
+def test_resolve_working_structure_adopts_prediction_without_inventing_cofactors():
     from PhiEx.pipeline import resolve_working_structure
     predicted = _toy_complex().protein
     seq_only = Protein(name="exp", sequence=predicted.sequence)
     protein, cofactors = resolve_working_structure(seq_only, [], predicted)
     assert protein is predicted
-    assert len(cofactors) == 1 and cofactors[0].metadata.get("stub")
+    assert cofactors == []          # no synthetic heme any more
 
 
 def test_resolve_working_structure_keeps_experimental():
@@ -425,3 +425,118 @@ def test_alphafold_absent_stops_without_guessing(monkeypatch, tmp_path):
     monkeypatch.setattr(pdbmod, "_fetch_text", lambda u, **k: calls.append(u))
     assert pdbmod.fetch_alphafold_pdb("Q00002", cache_dir=tmp_path) is None
     assert calls == []          # no model_vN probing once the API says "absent"
+
+
+# ────────────────────────────────────────────────────────────────────────
+# active-site resolution
+# ────────────────────────────────────────────────────────────────────────
+
+def _res(i, name, atoms, chain="A"):
+    return Residue(index=i, name=name, chain=chain,
+                   atoms=tuple(Atom(k, n, n[0], xyz) for k, (n, xyz) in enumerate(atoms)))
+
+
+def _triad_protein(with_motif=True, with_acid=True):
+    """Gly-x-Ser-x-Gly with Ser OG — His NE2 — Glu OE2 hydrogen bonds,
+    plus filler residues far away."""
+    res = []
+    seq = ["GLY", "ALA", "SER", "ALA", "GLY"] if with_motif else ["ALA", "ALA", "SER", "ALA", "ALA"]
+    for i, nm in enumerate(seq, start=10):
+        atoms = [("N", (i*3.8, 0, 0)), ("CA", (i*3.8, 1, 0)), ("C", (i*3.8, 2, 0))]
+        if nm == "SER":
+            atoms.append(("OG", (0.0, 0.0, 0.0)))
+        res.append(_res(i, nm, atoms))
+    res.append(_res(40, "HIS", [("CA", (0, 5, 0)), ("ND1", (0, 4.6, 0)), ("NE2", (0, 2.8, 0))]))
+    if with_acid:
+        res.append(_res(60, "GLU", [("CA", (0, 9, 0)), ("OE1", (0, 8.0, 0)), ("OE2", (0, 7.4, 0))]))
+    return Protein(name="toy", residues=tuple(res), source="pdb")
+
+
+def test_triad_detected_with_motif_and_acid():
+    from PhiEx.analysis.site import resolve_active_site
+    site = resolve_active_site(_triad_protein(), [])
+    assert site is not None and site.source == "catalytic-triad"
+    assert site.residues == (12, 40, 60) and site.confidence == "high"
+    assert site.kind == "serine-hydrolase"
+
+
+def test_lone_ser_his_pair_is_not_trusted():
+    from PhiEx.analysis.site import resolve_active_site
+    assert resolve_active_site(_triad_protein(with_motif=False, with_acid=False), []) is None
+
+
+def test_real_cofactor_beats_triad_and_stub_cofactor_is_ignored():
+    from PhiEx.analysis.site import resolve_active_site
+    p = _triad_protein()
+    fe = Atom(0, "FE", "FE", (30.0, 0, 0))
+    heme = Cofactor(name="HEME", resname="HEM", atoms=(fe,), metal_atom=fe)
+    assert resolve_active_site(p, [heme]).source == "cofactor"
+    stub = Cofactor(name="HEME", resname="HEM", atoms=(fe,), metal_atom=fe,
+                    metadata={"stub": True})
+    assert resolve_active_site(p, [stub]).source == "catalytic-triad"
+
+
+def test_anchor_overrides_and_parses_formats():
+    from PhiEx.analysis.site import resolve_active_site, parse_anchor
+    assert parse_anchor("S12, Ser12 ,A:40,60") == [(None, "S", 12), (None, "S", 12),
+                                                  ("A", None, 40), (None, None, 60)]
+    site = resolve_active_site(_triad_protein(), [], anchor="S12,Ser12,H40")
+    assert site.source == "anchor" and site.residues == (12, 40)
+    mismatch = resolve_active_site(_triad_protein(), [], anchor="K12")
+    assert mismatch.notes and "Ser12" in mismatch.notes[0]
+    with pytest.raises(ValueError):
+        resolve_active_site(_triad_protein(), [], anchor="999")
+
+
+def test_fallback_pocket_does_not_move_a_known_site():
+    from PhiEx.analysis.site import resolve_active_site, choose_active_pocket
+    p = _triad_protein()
+    site = resolve_active_site(p, [])
+    near_but_off = Pocket(id="P1", center=(3.0, 3.0, 3.0), score=1.0)
+    active, site2, pockets = choose_active_pocket(p, [near_but_off], site, real_detector=False)
+    assert active.id == "SITE" and active.center == site.center
+    active, _, _ = choose_active_pocket(p, [near_but_off], site, real_detector=True)
+    assert active.id == "P1"           # a real P2Rank cavity within 8 Å is used
+
+
+def test_no_site_uses_top_pocket_with_low_confidence():
+    from PhiEx.analysis.site import choose_active_pocket
+    p = _triad_protein(with_motif=False, with_acid=False)
+    pk = [Pocket(id="P1", center=(1, 1, 1), score=0.4), Pocket(id="P2", center=(9, 9, 9), score=2.0)]
+    active, site, _ = choose_active_pocket(p, pk, None, real_detector=False)
+    assert active.id == "P2" and site.source == "pocket" and site.confidence == "low"
+
+
+# ────────────────────────────────────────────────────────────────────────
+# mutation scoring
+# ────────────────────────────────────────────────────────────────────────
+
+def test_mutation_llr_and_evaluator_use_structure_numbering():
+    import numpy as np
+    from PhiEx.adapters.esm2 import mutation_llr, AA20
+    from PhiEx.pipeline.apx import build_mutation_evaluator
+    lp = np.full((3, 20), -3.0)
+    lp[1, AA20.index("S")] = -0.1          # position 2 strongly prefers Ser
+    assert mutation_llr(lp, 2, "S", "A") == pytest.approx(-2.9)
+    chain = [_res(101, "GLY", [("CA", (0, 0, 0))]), _res(102, "SER", [("CA", (1, 0, 0))]),
+             _res(103, "GLY", [("CA", (2, 0, 0))])]
+    pred = Prediction(value={"aa_logprobs": lp}, uncertainty=0.0, meta={})
+    ev, desc = build_mutation_evaluator(pred, chain, None, None)
+    y, sd = ev({"type": "mutation", "residue": 102, "from": "S", "to": "A"})
+    assert y == pytest.approx(2.9) and "ESM-2" in desc
+
+
+def test_mutation_panel_uses_residue_map_not_sequence_index():
+    panel = generate_mutation_panel([102], "XXXX", ["A"], residue_aa={102: "S"})
+    assert {"type": "mutation", "residue": 102, "from": "S", "to": "A"} in panel
+
+
+def test_vina_pose_parser_keeps_heavy_atoms():
+    from PhiEx.adapters.vina import _split_pdbqt_models
+    txt = ("MODEL 1\n"
+           "ATOM      1  C1  UNL     1       1.000   2.000   3.000  1.00  0.00     0.000 C \n"
+           "ATOM      2  O1  UNL     1       1.500   2.000   3.000  1.00  0.00    -0.300 OA\n"
+           "ATOM      3  H1  UNL     1       1.900   2.000   3.000  1.00  0.00     0.200 HD\n"
+           "ENDMDL\n")
+    models = _split_pdbqt_models(txt)
+    assert len(models) == 1 and [a[1] for a in models[0]] == ["C", "O"]

@@ -175,11 +175,13 @@
     <div id="pdb-candidates" style="font-size:10px;color:var(--ink-dim);margin:4px 0;"></div>
     <div class="row"><label>MD ps</label><input id="i-ps" type="number" min="1" max="50" value="10" step="1"></div>
     <div class="row"><label>AL i steps</label><input id="i-iter" type="number" min="1" max="10" value="3" step="1"></div>
+    <div class="row" title="Residues that define the active site, e.g. S197,H351,E314. Leave empty to auto-detect (cofactor → catalytic triad → top pocket)."><label>Site anchor</label><input id="i-anchor" type="text" placeholder="auto  (e.g. S197,H351)"></div>
+    <div class="row" title="Ligand to dock, as SMILES. Leave empty for a default chosen from the site type (hydrolase → p-nitrophenyl acetate; heme → ascorbate)."><label>Ligand SMILES</label><input id="i-smiles" type="text" placeholder="auto by site type"></div>
 
     <h2><span class="sym">ϕ → ∃</span>PIPELINE STAGES</h2>
     <button class="btn phi" id="run-structure">1 ▸ STRUCTURE  (PDB + ESMFold)</button>
     <button class="btn phi" id="run-annotate">2 ▸ ANNOTATE   (ESM-2 + Foldseek)</button>
-    <button class="btn phi" id="run-pockets">3 ▸ POCKETS    (P2Rank + cofactor heuristic)</button>
+    <button class="btn phi" id="run-pockets">3 ▸ SITE + POCKETS  (anchor / cofactor / triad / P2Rank)</button>
     <button class="btn phi" id="run-dock">4 ▸ DOCK       (Vina adapter)</button>
     <button class="btn phi" id="run-dynamics">5 ▸ DYNAMICS  (OpenMM + MACE region)</button>
 
@@ -234,7 +236,7 @@
     <div class="readout" id="md-readout">
       MACE region: <b id="v-mace-n">—</b> atoms<br>
       MACE E: <b id="v-mace">—</b> ± <b id="v-mace-sd">—</b> eV<br>
-      residence near heme Fe: <b id="v-res">—</b> ps
+      residence near site: <b id="v-res">—</b> ps
     </div>
 
     <h2><span class="sym">s∃ ⟳ tϕ</span>ACTIVE LEARNING</h2>

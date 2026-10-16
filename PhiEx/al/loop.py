@@ -164,7 +164,8 @@ class ActiveLearningLoop:
 
 def generate_mutation_panel(active_site_residues: list[int],
                             sequence: str,
-                            substitutions: list[str] = None) -> list[dict]:
+                            substitutions: list[str] = None,
+                            residue_aa: "dict[int, str] | None" = None) -> list[dict]:
     """Build a small mutation panel for the AL loop.  By default we
     mutate every active-site residue to A, K, and the conservative
     substitute (R→K, D→E, F→Y …).  Documented in README as the v0
@@ -174,9 +175,15 @@ def generate_mutation_panel(active_site_residues: list[int],
     conservative = {"R":"K","K":"R","D":"E","E":"D","F":"Y","Y":"F",
                     "S":"T","T":"S","I":"V","V":"I","L":"V","M":"I"}
     for resid in active_site_residues:
-        if resid - 1 < 0 or resid - 1 >= len(sequence):
-            continue
-        wt = sequence[resid - 1].upper()
+        if residue_aa is not None:
+            # structure numbering (PDB resseq) need not equal sequence index
+            wt = (residue_aa.get(resid) or "").upper()
+            if not wt or wt == "X":
+                continue
+        else:
+            if resid - 1 < 0 or resid - 1 >= len(sequence):
+                continue
+            wt = sequence[resid - 1].upper()
         for to in subs:
             if to != wt:
                 panel.append({"type": "mutation", "residue": resid,

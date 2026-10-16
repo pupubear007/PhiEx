@@ -296,6 +296,7 @@ $("#run-structure").addEventListener("click", async () => {
       `protein: <b>${r.experimental.name||"—"}</b><br>` +
       `cofactors: <b>${r.cofactors.map(c=>c.name).join(", ")||"—"}</b><br>` +
       `active site: <b>—</b>`;
+    residueLabels = r.residue_labels || {};
   } catch(e){ alert("structure: "+e.message); }
 });
 
@@ -314,24 +315,28 @@ $("#run-annotate").addEventListener("click", async () => {
 
 $("#run-pockets").addEventListener("click", async () => {
   try {
-    const r = await postJSON("/api/pockets", {});
+    const r = await postJSON("/api/pockets", {anchor: $("#i-anchor").value.trim() || null});
     lastPockets = r.pockets;
+    lastSite = r.site || null;
     const html = (r.pockets||[]).map(p =>
       `<div>${p.is_active_site?'<span style="color:var(--accent)">★ </span>':''}<b>${p.id}</b> score ${p.score.toFixed(2)} · ${p.nearby_residues.length} residues</div>`
     ).join("") || "no pockets";
-    $("#pockets-readout").innerHTML = html + `<div style="color:var(--ink-dim);font-size:10px">σ ${(r.score_sd||0).toFixed(2)}</div>`;
+    $("#pockets-readout").innerHTML = siteHTML(r.site) + html + `<div style="color:var(--ink-dim);font-size:10px">σ ${(r.score_sd||0).toFixed(2)}</div>`;
     if (r.active_site_id)
-      $("#state-readout").innerHTML = $("#state-readout").innerHTML.replace(/active site:.*/, `active site: <b>${r.active_site_id}</b>`);
+      $("#state-readout").innerHTML = $("#state-readout").innerHTML.replace(/active site:.*/,
+        `active site: <b>${r.site ? r.site.label : r.active_site_id}</b> (${r.active_site_id})`);
   } catch(e){ alert("pockets: "+e.message); }
 });
 
 $("#run-dock").addEventListener("click", async () => {
   try {
-    const r = await postJSON("/api/dock", {method: "vina"});
+    const smi = $("#i-smiles").value.trim();
+    const r = await postJSON("/api/dock", {method: "vina", smiles: smi || null});
     lastPoses = r.poses;
     drawPoses(r.poses);
     $("#poses-readout").innerHTML =
-      `<b>${r.n_poses}</b> poses · best <b>${(r.poses[0]||{}).score?.toFixed(2)}</b> ± <b>${((r.poses[0]||{}).score_uncertainty||0).toFixed(2)}</b> kcal/mol`;
+      `<b>${r.ligand ? r.ligand.name : "ligand"}</b>: <b>${r.n_poses}</b> poses · best <b>${(r.poses[0]||{}).score?.toFixed(2)}</b> kcal/mol` +
+      ((r.pose_contacts||[]).length ? `<br>contacts: ${r.pose_contacts.map(pill).join("")}` : "");
   } catch(e){ alert("dock: "+e.message); }
 });
 
@@ -344,8 +349,9 @@ $("#run-dynamics").addEventListener("click", async () => {
     $("#v-mace-n").textContent  = r.mace ? r.mace.region_atoms : "—";
     $("#v-mace").textContent    = r.mace ? r.mace.energy_ev.toFixed(3) : "—";
     $("#v-mace-sd").textContent = r.mace ? r.mace.energy_sd.toFixed(3) : "—";
-    $("#v-res").textContent     = r.residence_ps_near_heme_fe != null
-                                  ? r.residence_ps_near_heme_fe.toFixed(2) : "—";
+    $("#v-res").textContent     = r.residence_ps_near_site != null
+                                  ? r.residence_ps_near_site.toFixed(2)
+                                  : (r.ligand_simulated === false ? "n/a (ligand not simulated)" : "—");
   } catch(e){ alert("dynamics: "+e.message); }
 });
 
@@ -452,7 +458,7 @@ async function resetAll(){
   $("#poses-readout").innerHTML      = "no poses yet";
   $("#md-readout").innerHTML         = "MACE region: <b id=\"v-mace-n\">—</b> atoms<br>" +
                                         "MACE E: <b id=\"v-mace\">—</b> ± <b id=\"v-mace-sd\">—</b> eV<br>" +
-                                        "residence near heme Fe: <b id=\"v-res\">—</b> ps";
+                                        "residence near site: <b id=\"v-res\">—</b> ps";
   $("#al-readout").innerHTML         = "no iterations yet";
   $("#cross-readout").innerHTML      = "run AL first to populate";
   $("#struct-readout").innerHTML     = "mean pLDDT: <b id=\"v-plddt\">—</b><br>" +
@@ -621,7 +627,7 @@ async function highlightDiscoveryResidues(){
   const okPred = await _addDiscoveryHighlight("viewer-pred", lastDiscoveries);
   const okExp  = await _addDiscoveryHighlight("viewer-exp",  lastDiscoveries);
   if (okPred || okExp) {
-    logSys(`★ discovery flags highlighted: R${lastDiscoveries.join(", R")}`);
+    logSys(`★ discovery flags highlighted: ${lastDiscoveries.map(resLabel).join(", ")}`);
   } else {
     logSys("highlight failed — see console (Mol* version mismatch?)");
   }
@@ -634,6 +640,9 @@ $("#run-all").addEventListener("click", async () => {
   // the right-hand panels.
   const body = {
     pdb_id: $("#i-pdb").value.trim(),
+    uniprot: $("#i-uniprot").value.trim() || null,
+    anchor: $("#i-anchor").value.trim() || null,
+    ligand_smiles: $("#i-smiles").value.trim() || null,
     md_total_ps: parseFloat($("#i-ps").value || "10"),
     al_iterations: parseInt($("#i-iter").value || "3", 10),
     use_diffdock: false,
@@ -668,6 +677,19 @@ $("#run-all").addEventListener("click", async () => {
     }
   }
 });
+
+// residue labels ("Ser197") come from the server; fall back to "#197"
+let residueLabels = {};
+let lastSite = null;
+function resLabel(n){ return residueLabels[n] || residueLabels[String(n)] || `#${n}`; }
+function pill(n, cls=""){ return `<span class="residue-pill ${cls}">${resLabel(n)}</span>`; }
+function siteHTML(site){
+  if (!site) return "";
+  const conf = {user:"var(--accent)", high:"var(--accent)", medium:"var(--ink)", low:"var(--warn, #c66)"}[site.confidence] || "var(--ink)";
+  const notes = (site.notes||[]).map(n=>`<div style="color:var(--ink-dim);font-size:10px">• ${n}</div>`).join("");
+  return `<div style="margin-bottom:6px">site: <b>${site.label}</b> ` +
+         `<span style="color:${conf}">[${site.source}, ${site.confidence}]</span>${notes}</div>`;
+}
 
 function renderPert(p){
   if (!p) return "—";
@@ -788,20 +810,27 @@ function renderResult(r){
   if (r.rmsd_pred_vs_exp != null) $("#v-rmsd").textContent = r.rmsd_pred_vs_exp.toFixed(2);
   if (r.esm2_embedding_sd != null) $("#v-emb").textContent = r.esm2_embedding_sd.toFixed(3);
 
-  // pockets / docking
-  $("#pockets-readout").innerHTML = (r.pockets||[]).map(p =>
+  // site / pockets / docking
+  residueLabels = r.residue_labels || {};
+  lastSite = r.site || null;
+  if (r.site && r.site.label)
+    $("#state-readout").innerHTML = $("#state-readout").innerHTML.replace(/active site:.*/,
+      `active site: <b>${r.site.label}</b> (${r.active_site_id||"—"})`);
+  $("#pockets-readout").innerHTML = siteHTML(r.site) + (r.pockets||[]).map(p =>
     `<div>${p.is_active_site?'<span style="color:var(--accent)">★ </span>':''}<b>${p.id}</b> score ${p.score.toFixed(2)} · ${p.nearby_residues.length} residues</div>`
   ).join("") || "no pockets";
   drawPoses(r.poses || []);
   $("#poses-readout").innerHTML =
-    `<b>${(r.poses||[]).length}</b> poses · best <b>${(r.poses[0]||{}).score?.toFixed(2)}</b>`;
+    `<b>${(r.ligand||{}).name || "ligand"}</b>: <b>${(r.poses||[]).length}</b> poses · best <b>${(r.poses[0]||{}).score?.toFixed(2)}</b> kcal/mol` +
+    ((r.pose_contacts||[]).length ? `<br>contacts: ${r.pose_contacts.map(pill).join("")}` : "");
 
   // dynamics
   drawEnergies(r.energies_ev);
   $("#v-mace-n").textContent  = r.mace_region_size||"—";
   $("#v-mace").textContent    = r.mace_energy_mean!=null ? r.mace_energy_mean.toFixed(3) : "—";
   $("#v-mace-sd").textContent = r.mace_energy_sd!=null ? r.mace_energy_sd.toFixed(3) : "—";
-  $("#v-res").textContent     = r.residence_ps_near_heme_fe!=null ? r.residence_ps_near_heme_fe.toFixed(2) : "—";
+  $("#v-res").textContent     = r.residence_ps_near_site!=null ? r.residence_ps_near_site.toFixed(2)
+                                : "n/a (ligand not simulated)";
 
   // AL
   lastAL = r.al_history || [];
@@ -813,14 +842,15 @@ function renderResult(r){
       `predicted <b>${last.predicted.toFixed(3)} ± ${last.predicted_sd.toFixed(3)}</b> · ` +
       `observed <b>${last.observed.toFixed(3)} ± ${last.observed_sd.toFixed(3)}</b><br>` +
       surrogateQuality(last) + `<br>` +
-      `converged residues: ${(r.al_converged_residues||[]).map(x=>`<span class="residue-pill">R${x}</span>`).join("")}`;
+      (r.al_scoring ? `<span style="color:var(--ink-dim);font-size:10px">objective: ${r.al_scoring}</span><br>` : "") +
+      `converged residues: ${(r.al_converged_residues||[]).map(x=>pill(x)).join("")}`;
   }
   // cross-check
   $("#cross-readout").innerHTML = r.cross_check_skipped
     ? `cross-check skipped: ${r.cross_check_skipped}`
-    : `agreement: ${(r.agreement_residues||[]).map(x=>`<span class="residue-pill agree">R${x}</span>`).join("") || "—"}<br>` +
-      `discovery flags (trajectory only): ${(r.disagreement_residues||[]).map(x=>`<span class="residue-pill disagree">R${x}</span>`).join("") || "—"}<br>` +
-      `attention only: ${(r.attention_only_residues||[]).map(x=>`<span class="residue-pill">R${x}</span>`).join("") || "—"}`;
+    : `agreement: ${(r.agreement_residues||[]).map(x=>pill(x,"agree")).join("") || "—"}<br>` +
+      `discovery flags (structure/simulation only): ${(r.disagreement_residues||[]).map(x=>pill(x,"disagree")).join("") || "—"}<br>` +
+      `attention only: ${(r.attention_only_residues||[]).map(x=>pill(x)).join("") || "—"}`;
 
   // remember the discovery-flag residues so the user can light them up in 3D
   lastDiscoveries = (r.disagreement_residues || []).slice();

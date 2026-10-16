@@ -99,6 +99,7 @@ dependencies:
       - fair-esm            # ESM-2 and ESMFold (pip canonical)
       - mace-torch          # MACE-OFF ML potential
       - scikit-optimize     # Bayesian acquisition for active learning
+      - meeko               # receptor/ligand PDBQT prep for real Vina docking
       # ESMFold without openfold (fair-esm's ESMFold needs openfold, which
       # does not build on Apple Silicon).  Pinned to a range that still
       # supports the conda PyTorch 2.2 build.
