@@ -9,7 +9,8 @@ swap.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
+import random
+from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
 from ..core.learned import Prediction
@@ -60,12 +61,37 @@ class ThompsonAcquisition:
 
     v0 uses the surrogate's μ ± σ as a Gaussian.  Replace with a true
     posterior sample once you swap to a Bayesian model.
+
+    The RNG lives for the lifetime of the acquisition object so that each
+    candidate gets an independent draw.  (Re-seeding per call would hand
+    every candidate the same standard-normal z, collapsing Thompson
+    sampling into a fixed μ + z·σ ranking.)  `seed` keeps runs reproducible.
     """
     seed: int = 0
     name: str = "thompson"
+    _rng: random.Random = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self._rng = random.Random(self.seed)
+
     def score(self, prediction: Prediction) -> float:
-        import random
-        rng = random.Random(self.seed)
         mu = float(prediction.value or 0.0)
         sd = float(prediction.uncertainty or 0.0)
-        return rng.gauss(mu, sd)
+        return self._rng.gauss(mu, sd)
+
+
+ACQUISITIONS = {
+    "ucb": UCBAcquisition,
+    "ei": ExpectedImprovementAcquisition,
+    "thompson": ThompsonAcquisition,
+}
+
+
+def make_acquisition(name: str) -> AcquisitionFunction:
+    """Build an acquisition function by its short name ("ucb", "ei",
+    "thompson").  Used by the JSON-stdio batch runner and the API."""
+    try:
+        return ACQUISITIONS[name.lower()]()
+    except KeyError:
+        raise ValueError(f"unknown acquisition {name!r}; "
+                         f"expected one of {sorted(ACQUISITIONS)}") from None

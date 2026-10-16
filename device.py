@@ -1,67 +1,17 @@
 """
-PhiEx.device — compute device selection.
+device — top-level shim for `PhiEx.device`.
 
-Choice order:
-    1.  explicit override via PHIEX_DEVICE env var ("cpu", "mps", "cuda")
-    2.  MPS  if available (Apple Silicon)
-    3.  CPU  (Linux, including MSI login / compute nodes)
+`PhiEx/device.py` is the single source of truth for device selection
+(PyTorch device + OpenMM platform).  This file only re-exports it so that
+`import device` from the repository root keeps working.
 
-We deliberately do NOT auto-select CUDA even if it's available.  For v0 the
-rule is: MPS on Mac, CPU on Linux.  Flip this later when you want GPU nodes.
-
-The MPS path sets PYTORCH_ENABLE_MPS_FALLBACK=1 so ops that haven't yet
-landed on MPS fall through to CPU instead of raising.
+    python device.py        # print the selected device and OpenMM platform
 """
 
-from __future__ import annotations
-import os
-import platform
-import logging
-
-log = logging.getLogger("PhiEx.device")
-
-
-def select_device(override: str | None = None) -> str:
-    """Return a torch device string: 'cpu', 'mps', or (if forced) 'cuda'."""
-    import torch   # imported lazily so this module is cheap to import
-
-    forced = override or os.environ.get("PHIEX_DEVICE")
-    if forced:
-        forced = forced.lower()
-        if forced not in {"cpu", "mps", "cuda"}:
-            raise ValueError(f"PHIEX_DEVICE={forced!r} not in cpu/mps/cuda")
-        log.info("device forced via env: %s", forced)
-        return forced
-
-    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
-        log.info("device auto-selected: mps (Apple Silicon %s)", platform.machine())
-        return "mps"
-
-    log.info("device auto-selected: cpu (%s)", platform.platform())
-    return "cpu"
-
-
-def describe_device(device: str) -> dict:
-    """Human-readable info about the chosen device.  Goes into the reasoning
-    ticker so every ϕ → ∃ call logs which substrate it ran on."""
-    import torch
-    info = {"device": device, "torch": torch.__version__}
-    if device == "mps":
-        info["backend"] = "Metal Performance Shaders"
-        info["fallback"] = os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "0")
-    elif device == "cuda":
-        info["backend"] = f"CUDA {torch.version.cuda}"
-        info["gpu"] = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "?"
-    else:
-        info["backend"] = "CPU"
-        info["threads"] = torch.get_num_threads()
-    return info
-
+from PhiEx.device import (  # noqa: F401
+    select_device, describe_device, select_openmm_platform,
+)
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-    dev = select_device()
-    print(f"selected device: {dev}")
-    for k, v in describe_device(dev).items():
-        print(f"  {k}: {v}")
+    import runpy
+    runpy.run_module("PhiEx.device", run_name="__main__")

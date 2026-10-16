@@ -47,6 +47,10 @@ class ActiveLearningLoop:
     candidates: list[dict] = field(default_factory=list)
     history: list[ALIterationResult] = field(default_factory=list)
     iteration: int = 0
+    # every (encoded perturbation, observation) pair seen so far — the
+    # training set the surrogate is refit on each iteration
+    _X: list = field(default_factory=list, repr=False)
+    _y: list = field(default_factory=list, repr=False)
 
     # ──────────────────────────────────────────────────────────────
     def seed(self, perturbations: list[dict]) -> None:
@@ -54,13 +58,12 @@ class ActiveLearningLoop:
         give the surrogate a starting tϕ.  Logged with i=0."""
         log("i", f"───── iteration i = 0 (seed batch, n={len(perturbations)}) ─────")
         X, y = [], []
-        from ..adapters.surrogate import encode_perturbation
         for p in perturbations:
             obs, sd = self.evaluator(p)
-            x = encode_perturbation(p)
-            X.append(x); y.append(obs)
+            X.append(self._encode(p)); y.append(obs)
             log("s", f"seed run: {self._render_pert(p)} → y={obs:.3f} ± {sd:.3f}")
-        report = self.surrogate.fit(X, y)
+        self._X.extend(X); self._y.extend(y)
+        report = self.surrogate.fit(list(self._X), list(self._y))
         log("t", f"tϕ seeded: surrogate fit on {report.n_samples} samples")
 
     # ──────────────────────────────────────────────────────────────
@@ -91,15 +94,12 @@ class ActiveLearningLoop:
         observed, observed_sd = self.evaluator(chosen)
         log("s", f"observed: y = {observed:.3f} ± {observed_sd:.3f}")
 
-        # 3) refit
-        from ..adapters.surrogate import encode_perturbation
-        x = encode_perturbation(chosen)
-        if hasattr(self.surrogate, "_x_buffer"):
-            X = self.surrogate._x_buffer + [x]
-            y = self.surrogate._y_buffer + [observed]
-        else:
-            X, y = [x], [observed]
-        report = self.surrogate.fit(X, y)
+        # an evaluated candidate is no longer a candidate
+        self.candidates = [c for c in self.candidates if c != chosen]
+
+        # 3) refit on everything observed so far (seed batch + iterations)
+        self._X.append(self._encode(chosen)); self._y.append(observed)
+        report = self.surrogate.fit(list(self._X), list(self._y))
         log("t", f"tϕ refit: n={report.n_samples}  "
                   f"RMSE={report.rmse}  R²={report.r2}")
 
@@ -113,6 +113,16 @@ class ActiveLearningLoop:
         )
         self.history.append(result)
         return result
+
+    # ──────────────────────────────────────────────────────────────
+    def _encode(self, p: dict) -> "list[float]":
+        """Encode with the surrogate's own encoder so the training features
+        match what `surrogate.predict` computes (same sequence length)."""
+        encode = getattr(self.surrogate, "encode", None)
+        if encode is not None:
+            return encode(p)
+        from ..adapters.surrogate import encode_perturbation
+        return encode_perturbation(p)
 
     # ──────────────────────────────────────────────────────────────
     def _render_pert(self, p: dict) -> str:

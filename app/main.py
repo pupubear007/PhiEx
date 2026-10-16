@@ -49,7 +49,7 @@ from PhiEx.adapters.diffdock import DiffDockAdapter
 from PhiEx.adapters.openmm_calc import OpenMMSimulator
 from PhiEx.adapters.mace import MACEAdapter, select_active_site_region
 from PhiEx.adapters.surrogate import GBRSurrogate, encode_perturbation
-from PhiEx.al import ActiveLearningLoop, UCBAcquisition, generate_mutation_panel
+from PhiEx.al import ActiveLearningLoop, make_acquisition, generate_mutation_panel
 
 from PhiEx.core.state import (Atom, Residue, Protein, Cofactor,
                                    Ligand, ComplexState, Pocket)
@@ -127,7 +127,7 @@ async def api_ticker_history():
 
 
 @app.get("/api/uniprot/{uniprot_id}/pdbs")
-async def api_uniprot_pdbs(uniprot_id: str):
+def api_uniprot_pdbs(uniprot_id: str):
     """Return all PDB entries cross-referenced from a UniProt ID, best
     resolution first.  The frontend's "find PDB" button uses this."""
     entries = list_pdbs_for_uniprot(uniprot_id)
@@ -165,6 +165,11 @@ async def events(request: Request):
 
 # ────────────────────────────────────────────────────────────────────────
 # pipeline routes
+#
+# These are plain `def` handlers on purpose: they do blocking work (network
+# fetches, ESMFold, MD), and FastAPI runs sync handlers in its threadpool.
+# Declaring them `async def` would stall the event loop — and with it the
+# /events ticker stream — for the whole duration of each stage.
 # ────────────────────────────────────────────────────────────────────────
 
 class StructureRequest(BaseModel):
@@ -174,7 +179,7 @@ class StructureRequest(BaseModel):
 
 
 @app.post("/api/structure")
-async def api_structure(req: StructureRequest):
+def api_structure(req: StructureRequest):
     protein, cofactors, ann = fetch_protein(req.pdb_id, req.uniprot)
     SESSION["protein"] = protein
     SESSION["cofactors"] = cofactors
@@ -208,7 +213,7 @@ class AnnotateRequest(BaseModel):
 
 
 @app.post("/api/annotate")
-async def api_annotate(req: AnnotateRequest):
+def api_annotate(req: AnnotateRequest):
     protein: Protein = SESSION.get("protein")
     if not protein:
         return JSONResponse({"error": "call /api/structure first"}, status_code=400)
@@ -227,7 +232,7 @@ async def api_annotate(req: AnnotateRequest):
 
 
 @app.post("/api/pockets")
-async def api_pockets():
+def api_pockets():
     protein: Protein = SESSION.get("protein")
     cofactors = SESSION.get("cofactors") or []
     if not protein:
@@ -251,7 +256,7 @@ class DockRequest(BaseModel):
 
 
 @app.post("/api/dock")
-async def api_dock(req: DockRequest):
+def api_dock(req: DockRequest):
     protein: Protein = SESSION.get("protein")
     cofactors = SESSION.get("cofactors") or []
     pockets: list[Pocket] = SESSION.get("pockets") or []
@@ -283,7 +288,7 @@ class DynamicsRequest(BaseModel):
 
 
 @app.post("/api/dynamics")
-async def api_dynamics(req: DynamicsRequest):
+def api_dynamics(req: DynamicsRequest):
     protein: Protein = SESSION.get("protein")
     cofactors = SESSION.get("cofactors") or []
     best = SESSION.get("best_pose")
@@ -331,7 +336,7 @@ class ALRequest(BaseModel):
 
 
 @app.post("/api/al/iterate")
-async def api_al(req: ALRequest):
+def api_al(req: ALRequest):
     protein: Protein = SESSION.get("protein")
     pockets = SESSION.get("pockets") or []
     if not protein or not pockets:
@@ -348,19 +353,24 @@ async def api_al(req: ALRequest):
     # evaluator: cheap synthetic for the API path; real evaluator is wired
     # by run_apx_pipeline.  README documents the swap.
     from PhiEx.runners.batch import synthetic_evaluator
+    try:
+        acquisition = make_acquisition(req.acquisition)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
     loop = SESSION.get("al_loop")
     if loop is None or not getattr(surrogate, "_trained", False):
         loop = ActiveLearningLoop(surrogate=surrogate, evaluator=synthetic_evaluator,
-                                   acquisition=UCBAcquisition())
+                                   acquisition=acquisition)
         loop.seed(candidates[:5])
         loop.set_candidates(candidates[5:])
         SESSION["al_loop"] = loop
+    elif loop.acquisition.name != acquisition.name:
+        loop.acquisition = acquisition
 
     history: list[dict] = []
     for _ in range(req.n_iterations):
         if not loop.candidates: break
         r = loop.iterate()
-        loop.candidates = [c for c in loop.candidates if c != r.chosen]
         history.append({
             "iteration": r.iteration, "chosen": r.chosen,
             "predicted": r.predicted, "predicted_sd": r.predicted_sd,
@@ -399,16 +409,35 @@ async def api_apx_run(req: APXRunRequest):
         return _result_to_json(result)
 
     async def gen():
-        # interleave the ticker stream with a final result event.
+        # interleave the ticker stream with a final result event.  Wait on
+        # the next ticker event and the pipeline future together: the last
+        # event is usually logged *before* the future resolves, so waiting
+        # on events alone would block forever once the pipeline goes quiet.
         loop = asyncio.get_running_loop()
+        events = TICKER.subscribe(replay=False)
+        next_ev = asyncio.ensure_future(events.__anext__())
         future = loop.run_in_executor(None, pipeline.run)
-        async for ev in TICKER.subscribe(replay=False):
-            yield f"data: {ev.to_json()}\n\n"
-            if future.done():
-                break
-        result = await future
-        payload = json.dumps({"event": "done", "result": _result_to_json(result)})
-        yield f"data: {payload}\n\n"
+        try:
+            while True:
+                done, _ = await asyncio.wait({next_ev, future},
+                                             return_when=asyncio.FIRST_COMPLETED)
+                if next_ev in done:
+                    yield f"data: {next_ev.result().to_json()}\n\n"
+                    next_ev = asyncio.ensure_future(events.__anext__())
+                elif future in done:
+                    break
+            result = await future
+            payload = json.dumps({"event": "done", "result": _result_to_json(result)})
+            yield f"data: {payload}\n\n"
+        finally:
+            # cancelling the pending __anext__ unwinds the subscription (its
+            # finally unregisters the queue); wait for that before closing
+            next_ev.cancel()
+            try:
+                await next_ev
+            except (asyncio.CancelledError, StopAsyncIteration):
+                pass
+            await events.aclose()
 
     return StreamingResponse(gen(), media_type="text/event-stream")
 
