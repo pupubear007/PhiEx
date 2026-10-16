@@ -277,7 +277,7 @@ const _pdbCache = new Map();          // containerId → pdb text
 // Per-viewer cleanup handles for the highlight overlay.
 const _highlightCells = new Map();    // containerId → array of state cells / refs
 
-$("#run-structure").addEventListener("click", async () => {
+async function runStructure() {
   const pdb = $("#i-pdb").value.trim();
   const uni = $("#i-uniprot").value.trim();
   try {
@@ -298,7 +298,8 @@ $("#run-structure").addEventListener("click", async () => {
       `active site: <b>—</b>`;
     residueLabels = r.residue_labels || {};
   } catch(e){ alert("structure: "+e.message); }
-});
+}
+$("#run-structure").addEventListener("click", () => runStructure());
 
 $("#run-annotate").addEventListener("click", async () => {
   try {
@@ -313,7 +314,7 @@ $("#run-annotate").addEventListener("click", async () => {
   } catch(e){ alert("annotate: "+e.message); }
 });
 
-$("#run-pockets").addEventListener("click", async () => {
+async function runPockets() {
   try {
     const r = await postJSON("/api/pockets", {anchor: $("#i-anchor").value.trim() || null});
     lastPockets = r.pockets;
@@ -326,7 +327,8 @@ $("#run-pockets").addEventListener("click", async () => {
       $("#state-readout").innerHTML = $("#state-readout").innerHTML.replace(/active site:.*/,
         `active site: <b>${r.site ? r.site.label : r.active_site_id}</b> (${r.active_site_id})`);
   } catch(e){ alert("pockets: "+e.message); }
-});
+}
+$("#run-pockets").addEventListener("click", () => runPockets());
 
 $("#run-dock").addEventListener("click", async () => {
   try {
@@ -908,3 +910,118 @@ function renderResult(r){
 
 // initial header refresh once theories begin populating
 setTimeout(refreshTheories, 500);
+
+// ════════════════════════════════════════════════════════════════════
+// Candidate-gene triage
+// ════════════════════════════════════════════════════════════════════
+let triagePoll = null;
+let triageRows = [];
+
+async function refreshCandidateFiles(){
+  try {
+    const r = await (await fetch("/api/candidates/local")).json();
+    const sel = $("#i-cand-file");
+    sel.innerHTML = `<option value="">— local candidate file —</option>` +
+      (r.files||[]).map(f => `<option value="${f}">${f}</option>`).join("");
+  } catch(_) {}
+}
+refreshCandidateFiles();
+
+$("#i-cand-file").addEventListener("change", async e => {
+  const name = e.target.value; if (!name) return;
+  const r = await fetch(`/api/candidates/local/${encodeURIComponent(name)}`);
+  if (r.ok) { $("#i-cands").value = await r.text(); logSys(`candidate file loaded: ${name}`); }
+});
+$("#cand-upload-btn").addEventListener("click", () => $("#i-cand-upload").click());
+$("#i-cand-upload").addEventListener("change", async e => {
+  const f = e.target.files[0]; if (!f) return;
+  $("#i-cands").value = await f.text();
+  logSys(`candidate file loaded from disk: ${f.name}`);
+});
+
+$("#run-triage").addEventListener("click", async () => {
+  const text = $("#i-cands").value.trim();
+  if (!text) { alert("triage: load or paste a candidate list first"); return; }
+  const body = {
+    text, dock: $("#i-cand-dock").checked,
+    organism: $("#i-cand-org").value,
+    sources: $("#i-cand-src").value.trim(),
+    tracks: $("#i-cand-track").value.split(","),
+    limit: parseInt($("#i-cand-limit").value || "0", 10),
+  };
+  try {
+    const r = await postJSON("/api/candidates/start", body);
+    $("#triage-readout").innerHTML = `triaging ${r.total} gene(s)… progress in the ticker`;
+    if (triagePoll) clearInterval(triagePoll);
+    triagePoll = setInterval(pollTriage, 3000);
+  } catch(e) { alert("triage: " + e.message); }
+});
+$("#stop-triage").addEventListener("click", () => postJSON("/api/candidates/stop", {}).catch(()=>{}));
+
+async function pollTriage(){
+  try {
+    const s = await (await fetch("/api/candidates/status")).json();
+    triageRows = s.rows || [];
+    renderTriage(s);
+    if (!s.running && triagePoll) { clearInterval(triagePoll); triagePoll = null; }
+  } catch(_) {}
+}
+
+function renderTriage(s){
+  const esc = v => String(v ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+  const fc = v => v == null ? "—" : (v > 0 ? "+" : "") + v.toFixed(1);
+  const rows = triageRows.map((r, i) => {
+    const struct = r.structure ? `${esc(r.structure.replace(/^AF:|^AFILL:/, m => m === "AFILL:" ? "AFill " : "AF "))}` +
+      (r.mean_plddt != null ? ` <span style="color:var(--ink-dim)">${r.mean_plddt.toFixed(0)}</span>` : "") : "—";
+    const site = r.site ? `${esc(r.site)} <span style="color:var(--ink-dim)">${esc(r.site_confidence)}</span>` : "—";
+    const dockc = r.error ? `<span style="color:var(--warn, #c66)" title="${esc(r.error)}">error</span>`
+      : r.best_ligand ? `${esc(r.best_ligand)} ${r.best_score.toFixed(1)}` +
+        (r.margin != null ? ` <b title="best binder − negative control (kcal/mol)">Δ${r.margin.toFixed(1)}</b>` : "")
+      : (r.track === "dock" ? `<span style="color:var(--ink-dim)">panel ready</span>` : "");
+    const warn = (r.warnings||[]).length ? ` <span title="${esc(r.warnings.join("\n"))}">⚠</span>` : "";
+    const full = $("#triage-readout").classList.contains("tri-full");
+    return `<tr class="tri-row" data-i="${i}" title="${esc(r.class_title)} — ${esc(r.description)}">` +
+      `<td>${esc(r.gene_id)}${warn}</td><td><span class="trk ${r.track}">${r.track}</span> ${esc(full ? r.class_title : r.class)}` +
+      (full ? `<div style="color:var(--ink-dim);font-size:10px">${esc((r.description||"").slice(0, 90))}</div>` : "") + `</td>` +
+      `<td class="num">${fc(r.peak_log2fc)}</td><td>${struct}</td><td>${site}</td><td>${dockc}</td></tr>`;
+  }).join("");
+  const counts = {dock:0, structure:0, unsuited:0};
+  triageRows.forEach(r => counts[r.track] = (counts[r.track]||0) + 1);
+  $("#triage-readout").innerHTML =
+    `<div style="margin-bottom:4px"><button class="btn" id="tri-expand" style="width:auto;padding:2px 8px;margin:0 6px 0 0;font-size:10px">${$("#triage-readout").classList.contains("tri-full") ? "✕ close" : "⤢ expand"}</button>` +
+    `${s.running ? "running" : "done"} · ${s.done}/${s.total} genes · ${s.elapsed}s · ` +
+    `<span class="trk dock">dock ${counts.dock}</span> <span class="trk structure">structure ${counts.structure}</span> ` +
+    `<span class="trk unsuited">unsuited ${counts.unsuited}</span></div>` +
+    `<div class="tri-wrap"><table class="screen-table"><tr><th>gene</th><th>class</th><th>log2FC</th><th>structure (pLDDT)</th><th>site</th><th>dock</th></tr>${rows}</table></div>` +
+    `<div style="color:var(--ink-dim);font-size:10px;margin-top:4px">click a row to open it: structure + site load, and its ligand panel fills the screen list (press 4b). ` +
+    `Δ = best binder − negative control, kcal/mol (larger = clearer).</div>` +
+    `<a href="/api/candidates.csv" download style="font-size:11px">⤓ download CSV</a>`;
+  document.querySelectorAll("#triage-readout tr.tri-row").forEach(tr =>
+    tr.addEventListener("click", () => {
+      $("#triage-readout").classList.remove("tri-full");
+      openCandidate(triageRows[+tr.dataset.i]);
+    }));
+  const ex = $("#tri-expand");
+  if (ex) ex.addEventListener("click", ev => {
+    ev.stopPropagation();
+    $("#triage-readout").classList.toggle("tri-full");
+    renderTriage(s);
+  });
+}
+
+async function openCandidate(r){
+  if (!r || !r.structure) { alert(`${r ? r.gene_id : "candidate"}: no structure available${r && r.error ? " — " + r.error : ""}`); return; }
+  $("#i-pdb").value = r.structure;
+  $("#i-uniprot").value = r.uniprot || "";
+  $("#i-anchor").value = "";
+  $("#i-smiles").value = "";
+  $("#i-ligands").value = (r.panel||[]).map(p => `${p.label}: ${p.value}`).join("\n");
+  logSys(`opening ${r.gene_id} (${r.class_title}) — ${r.structure}`);
+  if (r.note) logSys(`note: ${r.note}`);
+  (r.warnings||[]).forEach(w => logSys(`⚠ ${r.gene_id}: ${w}`));
+  await runStructure();
+  await runPockets();
+  if (r.screen) renderScreen({rows: r.screen, n_ok: r.screen.filter(x=>!x.error).length,
+                              n_failed: r.screen.filter(x=>x.error).length, seconds: "cached",
+                              site: {label: r.site}, pocket_id: ""});
+}

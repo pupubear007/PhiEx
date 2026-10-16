@@ -711,3 +711,116 @@ def test_screen_ranks_and_reports_failures(monkeypatch):
     assert out["n_failed"] == 1 and "not a valid SMILES" in out["rows"][-1]["error"]
     csv = S.rows_to_csv(out["rows"])
     assert csv.splitlines()[0].startswith("rank,name,score") and "butanol" in csv
+
+
+# ────────────────────────────────────────────────────────────────────────
+# candidate-gene triage
+# ────────────────────────────────────────────────────────────────────────
+
+def test_every_panel_smiles_parses_or_is_a_name():
+    from rdkit import Chem, RDLogger
+    from PhiEx.candidates.classes import all_panel_smiles
+    RDLogger.DisableLog("rdApp.*")
+    for key, value in all_panel_smiles():
+        looks_like_smiles = any(ch in value for ch in "()=[]#@/\\") and " " not in value
+        if looks_like_smiles:
+            assert Chem.MolFromSmiles(value) is not None, (key, value)
+
+
+def test_every_dock_class_has_a_negative_control():
+    from PhiEx.candidates.classes import RULES
+    for r in RULES:
+        if r.track == "dock" and r.key not in ("nlr", "kinase", "gtpase"):
+            assert any(p.role == "control" for p in r.panel), r.key
+
+
+def test_classify_annotation_examples():
+    from PhiEx.candidates.classes import classify
+    cases = {
+        ("Laccase; copper ion binding; hydroquinone:oxygen oxidoreductase activity", "AA1_3"): "laccase",
+        ("WSC domain | Predicted effector (EffectorP; Apoplastic effector); CAZyme (GH128)", "GH128"): "b13_glucanase",
+        ("WSC domain-containing protein", "AA5_1"): "cro",
+        ("Prolyl oligopeptidase (peptidase S9); serine-type peptidase activity; triacylglycerol lipase", ""): "peptidase",
+        ("Pectinesterase; Involved in maceration and soft-rotting", "CE8"): "pectinase",
+        ("Methyltransferase activity; sterol 24-C-methyltransferase activity", ""): "sterol_mt",
+        ("Lectin (Ssp1/fucose-specific type)", ""): "lectin_fucose",
+        ("Lectin; Agglutinin", ""): "lectin_gal",
+        ("Auxin responsive GH3 gene family (GH3); Indole-3-acetic acid-amido synthetase GH3.6", ""): "gh3_amido",
+        ("L-type lectin-domain containing receptor kinase IX.1", ""): "kinase",
+        ("WRKY transcription factor 40-related", ""): "tf",
+        ("Nucleic acid binding; ribonuclease H activity; Reverse transcriptase", ""): "transposon",
+        ("Uncharacterized | Predicted effector (EffectorP; Apoplastic effector)", "NA"): "effector_unknown",
+        ("Hydrolase activity, hydrolyzing O-glycosyl compounds", "GH43_1"): "hemicellulase",
+    }
+    for (desc, fam), want in cases.items():
+        assert classify(desc, fam).key == want, (desc, classify(desc, fam).key)
+
+
+def test_parse_candidates_tsv_and_plain_list():
+    from PhiEx.candidates.triage import parse_candidates
+    tsv = ("gene_id\torganism\tuniprot\tdescription\tfamily\tsources\tlog2fc_24\tlog2fc_48\tlog2fc_96\n"
+           "SS1G_00001\tS. sclerotiorum\tA7EYZ9\tAlcohol dehydrogenase (NADP(+))\t\tT1\t-1.5\t3.0\t0.5\n")
+    c = parse_candidates(tsv)[0]
+    assert c.gene_id == "SS1G_00001" and c.uniprot == "A7EYZ9" and c.log2fc == (-1.5, 3.0, 0.5)
+    plain = parse_candidates("SS1G_00002 LysM protein\nglyma.01g000100\nSS1G_00002 duplicate\nnot a gene")
+    assert [x.gene_id for x in plain] == ["SS1G_00002", "Glyma.01G000100"]
+
+
+def test_accession_parsing():
+    from PhiEx.candidates.resolve import accession_from
+    assert accession_from("665079.A7EYZ9") == "A7EYZ9"
+    assert accession_from("A0A0R0HLQ4") == "A0A0R0HLQ4"
+    assert accession_from("SS1G_10565") is None
+
+
+def _patch_triage_offline(monkeypatch, pdb_text):
+    from PhiEx.candidates import triage as T
+    from PhiEx.adapters import pdb as P
+    monkeypatch.setattr(T, "resolve_uniprot", lambda g, h="": ("A7F474", "test"))
+    monkeypatch.setattr(T, "choose_structure", lambda acc, cls: ("AF:A7F474", "AlphaFold"))
+    monkeypatch.setattr(P, "fetch_protein", lambda pid, up: (*P.parse_pdb_text(pdb_text, name=pid), {}))
+
+
+def test_triage_one_structure_only_on_alphafold_model(monkeypatch):
+    from pathlib import Path
+    from PhiEx.candidates.triage import triage_one, Candidate
+    pdb_text = (Path(__file__).parent / "data" / "AF_A7F474.pdb").read_text()
+    _patch_triage_offline(monkeypatch, pdb_text)
+    row = triage_one(Candidate(gene_id="SS1G_00003", description="Alpha/beta hydrolase fold-3 domain-containing protein",
+                               log2fc=(1.0, -2.5, None)), dock=False)
+    assert row["error"] is None and row["class"] == "cutinase_esterase" and row["track"] == "dock"
+    assert "Ser197" in row["site"] and row["site_confidence"] == "high"
+    assert row["mean_plddt"] > 85 and row["site_plddt"] > 85
+    assert row["peak_log2fc"] == -2.5 and row["direction"].startswith("down")
+    assert any(p["role"] == "control" for p in row["panel"])
+
+
+def test_triage_one_reports_margin_against_control(monkeypatch):
+    from pathlib import Path
+    from PhiEx.candidates import triage as T
+    from PhiEx.pipeline import screen as S
+    pdb_text = (Path(__file__).parent / "data" / "AF_A7F474.pdb").read_text()
+    _patch_triage_offline(monkeypatch, pdb_text)
+    def fake_screen(state, pocket, site, entries, exhaustiveness=8):
+        rows = []
+        for i, (label, value) in enumerate(entries):
+            score = -4.0 if "control" in label else -5.0 - i * 0.1
+            rows.append({"name": label, "input": value, "score": score, "efficiency": 0.3,
+                         "site_hits": [197, 351], "error": None})
+        return {"rows": rows}
+    monkeypatch.setattr(S, "screen_ligands", fake_screen)
+    row = T.triage_one(T.Candidate(gene_id="SS1G_00004", description="CAZyme (CE5); Cutinase"), dock=True)
+    assert row["docked"] and row["best_role"] != "control"
+    assert row["control_score"] == -4.0 and row["margin"] == pytest.approx(row["control_score"] - row["best_score"])
+
+
+def test_unsuited_genes_are_not_docked(monkeypatch):
+    from pathlib import Path
+    from PhiEx.candidates.triage import triage_one, Candidate, sort_rows, rows_to_csv
+    pdb_text = (Path(__file__).parent / "data" / "AF_A7F474.pdb").read_text()
+    _patch_triage_offline(monkeypatch, pdb_text)
+    tf = triage_one(Candidate(gene_id="Glyma.01G000200", description="WRKY transcription factor 40-related"), dock=True)
+    assert tf["track"] == "unsuited" and not tf["docked"] and tf["warnings"]
+    enz = triage_one(Candidate(gene_id="SS1G_00003", description="Alpha/beta hydrolase fold-3"), dock=False)
+    assert [r["gene_id"] for r in sort_rows([tf, enz])] == ["SS1G_00003", "Glyma.01G000200"]
+    assert rows_to_csv([enz]).splitlines()[0].startswith("gene_id,organism,class_title")

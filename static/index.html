@@ -77,6 +77,18 @@
     font: 11px/1.4 ui-monospace, Menlo, monospace; padding: 6px;
   }
   .screen-table { width: 100%; border-collapse: collapse; font-size: 10.5px; }
+  #triage-readout .tri-wrap { max-height: 420px; overflow: auto; }
+  #triage-readout table td, #triage-readout table th { white-space: nowrap; }
+  #triage-readout.tri-full { position: fixed; inset: 56px 32px 32px 32px; z-index: 60; overflow: auto;
+    background: var(--bg, #0b0e12); border: 1px solid var(--line, #444); padding: 14px; font-size: 12px;
+    box-shadow: 0 10px 40px rgba(0,0,0,.6); }
+  #triage-readout.tri-full .tri-wrap { max-height: none; }
+  #triage-readout.tri-full table td, #triage-readout.tri-full table th { white-space: normal; }
+  #triage-readout tr.tri-row { cursor: pointer; }
+  #triage-readout tr.tri-row:hover td { background: rgba(127,127,127,.15); }
+  .trk { font-size: 9px; padding: 0 3px; border-radius: 3px; border: 1px solid currentColor; }
+  .trk.dock { color: var(--accent, #6cf); } .trk.structure { color: var(--ink-dim, #999); } .trk.unsuited { color: var(--warn, #c66); }
+  aside select { background: var(--bg, #0b0e12); color: var(--ink, #ddd); border: 1px solid var(--line, #333); font: inherit; }
   .screen-table th, .screen-table td { padding: 2px 4px; text-align: left; border-bottom: 1px solid rgba(127,127,127,.2); vertical-align: top; }
   .screen-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
   .screen-table tr.err td { color: var(--ink-dim); }
@@ -197,6 +209,24 @@
     <button class="btn phi" id="run-screen">4b ▸ SCREEN LIGANDS  (dock list, rank)</button>
     <button class="btn phi" id="run-dynamics">5 ▸ DYNAMICS  (OpenMM + MACE region)</button>
 
+    <h2><span class="sym">∃ᵢ</span>CANDIDATE GENES</h2>
+    <div class="row" title="Candidate files in data/candidates/ on this computer (kept out of git)">
+      <select id="i-cand-file" style="flex:1"><option value="">— local candidate file —</option></select>
+      <input id="i-cand-upload" type="file" accept=".tsv,.csv,.txt" style="display:none">
+      <button class="btn" id="cand-upload-btn" style="width:auto;padding:4px 8px;margin:0 0 0 4px">⤒</button>
+    </div>
+    <textarea id="i-cands" rows="3" spellcheck="false"
+      placeholder="TSV with a gene_id column, or one gene ID per line: SS1G_xxxxx, Glyma.xxGxxxxxx …"></textarea>
+    <div class="row"><label>organism</label>
+      <select id="i-cand-org"><option value="all">all</option><option value="pathogen">S. sclerotiorum</option><option value="host">soybean</option></select></div>
+    <div class="row" title="keep rows whose sources contain any of these, e.g. TableS1.1,Table6 (empty = all)"><label>tables</label><input id="i-cand-src" type="text" placeholder="e.g. TableS1.1,Table6"></div>
+    <div class="row"><label>tracks</label>
+      <select id="i-cand-track"><option value="dock,structure,unsuited">all</option><option value="dock">dockable only</option><option value="dock,structure">dock + structure</option></select></div>
+    <div class="row"><label>max genes</label><input id="i-cand-limit" type="number" min="0" value="0" step="10"></div>
+    <div class="row" title="Dock each dockable gene's ligand panel (substrates, inhibitors, negative control). ~1 min per gene."><label>dock panels</label><input id="i-cand-dock" type="checkbox" style="width:auto"></div>
+    <button class="btn phi" id="run-triage">▶ TRIAGE CANDIDATES</button>
+    <button class="btn" id="stop-triage">⏹ STOP</button>
+
     <h2><span class="sym">s∃ ⟳ tϕ</span>INDUCTIVE</h2>
     <button class="btn s" id="run-al">⟳ NEXT ITERATION  (i ← i+1)</button>
     <button class="btn warn" id="run-all">⊙ RUN END-TO-END (streamed)</button>
@@ -242,6 +272,9 @@
     <h2><span class="sym">s∃</span>DOCKING POSES</h2>
     <div class="readout" id="poses-readout">no poses yet</div>
     <canvas class="chart" id="poses-chart"></canvas>
+
+    <h2><span class="sym">∃ᵢ</span>CANDIDATE TRIAGE</h2>
+    <div class="readout" id="triage-readout">load a candidate list (left) and press ▶ TRIAGE</div>
 
     <h2><span class="sym">s∃</span>LIGAND SCREEN</h2>
     <div class="readout" id="screen-readout">paste ligands under stage 4 and press 4b</div>

@@ -80,3 +80,5 @@ htmlcov/
 .env.local
 secrets.*
 *.pem
+data/candidates/
+data/ch3/

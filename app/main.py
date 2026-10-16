@@ -386,6 +386,96 @@ def api_dock_batch_csv():
                     headers={"Content-Disposition": "attachment; filename=phiex_ligand_screen.csv"})
 
 
+# ────────────────────────────────────────────────────────────────────────
+# candidate-gene triage (transcriptomics candidate list → structures, sites,
+# ligand panels).  Runs in a background thread; the UI polls /status.
+# ────────────────────────────────────────────────────────────────────────
+
+class TriageRequest(BaseModel):
+    text: str                          # TSV with a gene column, or one gene ID per line
+    dock: bool = False                 # dock each dock-track gene's ligand panel (slow)
+    exhaustiveness: int = 8
+    organism: str = "all"              # all | pathogen | host
+    tracks: list[str] = ["dock", "structure", "unsuited"]
+    sources: str = ""                  # e.g. "TableS1.1,Table6" — keep rows whose sources contain any
+    limit: int = 0                     # 0 = no limit
+    use_cache: bool = True
+
+
+@app.post("/api/candidates/start")
+def api_candidates_start(req: TriageRequest):
+    from PhiEx.candidates.triage import parse_candidates, TriageJob
+    from PhiEx.candidates.classes import classify
+    job = SESSION.get("triage")
+    if job is not None and job.running:
+        return JSONResponse({"error": "a triage is already running — stop it first"}, status_code=409)
+    cands = parse_candidates(req.text)
+    if req.organism == "pathogen":
+        cands = [c for c in cands if not c.gene_id.startswith("Glyma")]
+    elif req.organism == "host":
+        cands = [c for c in cands if c.gene_id.startswith("Glyma")]
+    if req.sources.strip():
+        want = [s.strip() for s in req.sources.split(",") if s.strip()]
+        cands = [c for c in cands if any(w in (c.sources or "") for w in want)]
+    cands = [c for c in cands if classify(c.description, c.family).track in set(req.tracks)]
+    if req.limit and req.limit > 0:
+        cands = cands[:req.limit]
+    if not cands:
+        return JSONResponse({"error": "no candidate genes after filtering"}, status_code=400)
+    job = TriageJob(candidates=cands, dock=req.dock,
+                    exhaustiveness=max(1, min(32, req.exhaustiveness)), use_cache=req.use_cache)
+    SESSION["triage"] = job
+    job.start()
+    return {"started": True, "total": len(cands)}
+
+
+@app.get("/api/candidates/status")
+def api_candidates_status():
+    job = SESSION.get("triage")
+    if job is None:
+        return {"running": False, "done": 0, "total": 0, "rows": []}
+    return job.status()
+
+
+@app.post("/api/candidates/stop")
+def api_candidates_stop():
+    job = SESSION.get("triage")
+    if job is not None:
+        job.stop_requested = True
+    return {"stopping": bool(job and job.running)}
+
+
+@app.get("/api/candidates.csv")
+def api_candidates_csv():
+    from PhiEx.candidates.triage import rows_to_csv
+    from fastapi.responses import Response
+    job = SESSION.get("triage")
+    if job is None or not job.rows:
+        return JSONResponse({"error": "no triage results yet"}, status_code=404)
+    return Response(rows_to_csv(job.status()["rows"]), media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=phiex_candidate_triage.csv"})
+
+
+@app.get("/api/candidates/local")
+def api_candidates_local():
+    """List candidate files kept locally under data/candidates/ (never in git)."""
+    from pathlib import Path
+    root = Path("data/candidates")
+    files = sorted(p.name for p in root.glob("*.tsv")) + sorted(p.name for p in root.glob("*.csv")
+                                                                if p.name != "triage_cache.csv")
+    return {"files": files}
+
+
+@app.get("/api/candidates/local/{name}")
+def api_candidates_local_file(name: str):
+    from pathlib import Path
+    from fastapi.responses import PlainTextResponse
+    p = Path("data/candidates") / Path(name).name
+    if not p.exists() or p.suffix not in (".tsv", ".csv"):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return PlainTextResponse(p.read_text())
+
+
 class DynamicsRequest(BaseModel):
     total_ps: float = 10.0
     use_mace: bool = True

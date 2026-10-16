@@ -268,6 +268,44 @@ for mutagenesis around a site you trust. They are only as good as the
 site: check the *site* line in the Pockets panel (source + confidence)
 before using them.
 
+## Candidate-gene triage (transcriptomics → structure → ligands)
+
+For a list of candidate genes from an expression study (e.g. DESeq2 hits,
+network hubs, predicted effectors/CAZymes), PhiEx asks, gene by gene, *what
+can structure-based modelling actually say about this protein?*
+
+1. **Class and track** (`PhiEx/candidates/classes.py`): the annotation and
+   CAZy family are matched against explicit rules. Each class has a track —
+   **dock** (enzyme or binding protein with known small-molecule partners),
+   **structure** (no known ligand: use structure, pockets and Foldseek
+   neighbours to build a function hypothesis) or **unsuited** (transcription
+   factors, transposon proteins, membrane transporters, protein–protein
+   binders, housekeeping machinery) — plus the cofactor its site needs and a
+   ligand panel with roles (substrate / product / inhibitor / cofactor /
+   **negative control**).
+2. **UniProt**: from the STRING id when given, else the UniProt REST search
+   (`SS1G_xxxxx` → organism 665079; `Glyma.xxGxxxxxx` → ORF name
+   `GLYMA_xxGxxxxxx`, taxon 3847). Cached in `data/candidates/`.
+3. **Structure**: experimental PDB if one exists, else **AlphaFill** when the
+   class needs a cofactor (heme, Cu, FAD, NAD(P), PLP, Fe, Mn …), else
+   AlphaFold, else SWISS-MODEL.
+4. **Site and confidence**: site resolution as above; mean pLDDT and the
+   pLDDT of the site residues (site pLDDT < 70 is flagged).
+5. **Optional docking**: the class panel is docked into the site and the row
+   reports the best binder and its **margin over the negative control**
+   (kcal/mol). The margin, not the raw Vina score, is what to rank on.
+
+In the UI: *CANDIDATE GENES* (left) — load a TSV with a `gene_id` column
+(optional `uniprot`, `description`, `family`, `sources`, `log2fc_24/48/96`)
+or paste gene IDs; filter by organism, source table, track; tick *dock
+panels* for docking (about a minute per gene). Results stream into
+*CANDIDATE TRIAGE* (right); click a row to open its structure and site, with
+its ligand panel loaded into the screen list. CSV: `/api/candidates.csv`.
+Results are cached per gene, so a long list can be stopped and resumed.
+
+Candidate files and caches live in `data/candidates/`, which is git-ignored:
+unpublished candidate lists never leave the machine through the repository.
+
 ## Known simplifications and stubs (called out explicitly)
 
 These are the v0 corners. Each is a localised swap; the repo's adapters
