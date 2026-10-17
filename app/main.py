@@ -201,6 +201,14 @@ class StructureRequest(BaseModel):
 @app.post("/api/structure")
 def api_structure(req: StructureRequest):
     protein, cofactors, ann = fetch_protein(req.pdb_id, req.uniprot)
+    if not protein.residues and protein.source == "unavailable":
+        # never leave the previous protein in place: every later stage would
+        # silently run on it while the UI shows the new accession
+        for k in ("protein", "cofactors", "uniprot", "site", "pockets", "active_pocket",
+                  "pose_contacts", "esm2_pred", "best_pose"):
+            SESSION.pop(k, None)
+        return JSONResponse({"error": f"no structure could be downloaded for {req.pdb_id} "
+                                      f"(UniProt {req.uniprot or '—'}); see the log"}, status_code=404)
     SESSION["annotations"] = ann
     out: dict[str, Any] = {
         "experimental": _protein_summary(protein),
@@ -227,6 +235,13 @@ def api_structure(req: StructureRequest):
     # one-shot pipeline operate on the same working structure
     working, cofactors = resolve_working_structure(protein, cofactors, predicted)
     SESSION["protein"] = working
+    acc = (req.uniprot or "").strip()
+    used = protein.name or req.pdb_id          # may differ: AFILL → AF fallback
+    if ":" in used and used.split(":", 1)[0].upper() in ("AF", "AFILL", "SWISS"):
+        acc = used.split(":", 1)[1]
+    SESSION["uniprot"] = acc
+    for k in ("site", "pockets", "active_pocket", "pose_contacts", "esm2_pred", "best_pose"):
+        SESSION.pop(k, None)              # stale per-structure state
     SESSION["cofactors"] = cofactors
     out["working_source"] = working.source
     out["residue_labels"] = {r.index: f"{r.name.title()}{r.index}"
@@ -285,6 +300,7 @@ def api_pockets(req: PocketsRequest | None = None):
                                                  real_detector=not p2.is_stub)
     log_site(site, active)
     SESSION["pockets"] = pockets
+    SESSION["active_pocket"] = active
     SESSION["site"] = site
     return {
         "pockets": [_pocket_json(p) for p in pockets],
@@ -384,6 +400,129 @@ def api_dock_batch_csv():
         return JSONResponse({"error": "no screen run yet"}, status_code=404)
     return Response(rows_to_csv(out["rows"]), media_type="text/csv",
                     headers={"Content-Disposition": "attachment; filename=phiex_ligand_screen.csv"})
+
+
+# ────────────────────────────────────────────────────────────────────────
+# candidate-gene triage (transcriptomics candidate list → structures, sites,
+# ligand panels).  Runs in a background thread; the UI polls /status.
+# ────────────────────────────────────────────────────────────────────────
+
+class TriageRequest(BaseModel):
+    text: str                          # TSV with a gene column, or one gene ID per line
+    dock: bool = False                 # dock each dock-track gene's ligand panel (slow)
+    exhaustiveness: int = 8
+    organism: str = "all"              # all | pathogen | host
+    tracks: list[str] = ["dock", "structure", "unsuited"]
+    sources: str = ""                  # e.g. "TableS1.1,Table6" — keep rows whose sources contain any
+    limit: int = 0                     # 0 = no limit
+    use_cache: bool = True
+
+
+@app.post("/api/candidates/start")
+def api_candidates_start(req: TriageRequest):
+    from PhiEx.candidates.triage import parse_candidates, TriageJob
+    from PhiEx.candidates.classes import classify
+    job = SESSION.get("triage")
+    if job is not None and job.running:
+        return JSONResponse({"error": "a triage is already running — stop it first"}, status_code=409)
+    cands = parse_candidates(req.text)
+    if req.organism == "pathogen":
+        cands = [c for c in cands if not c.gene_id.startswith("Glyma")]
+    elif req.organism == "host":
+        cands = [c for c in cands if c.gene_id.startswith("Glyma")]
+    if req.sources.strip():
+        want = [s.strip() for s in req.sources.split(",") if s.strip()]
+        cands = [c for c in cands if any(w in (c.sources or "") for w in want)]
+    cands = [c for c in cands if classify(c.description, c.family).track in set(req.tracks)]
+    if req.limit and req.limit > 0:
+        cands = cands[:req.limit]
+    if not cands:
+        return JSONResponse({"error": "no candidate genes after filtering"}, status_code=400)
+    job = TriageJob(candidates=cands, dock=req.dock,
+                    exhaustiveness=max(1, min(32, req.exhaustiveness)), use_cache=req.use_cache)
+    SESSION["triage"] = job
+    job.start()
+    return {"started": True, "total": len(cands)}
+
+
+@app.get("/api/candidates/status")
+def api_candidates_status():
+    job = SESSION.get("triage")
+    if job is None:
+        return {"running": False, "done": 0, "total": 0, "rows": []}
+    return job.status()
+
+
+@app.post("/api/candidates/stop")
+def api_candidates_stop():
+    job = SESSION.get("triage")
+    if job is not None:
+        job.stop_requested = True
+    return {"stopping": bool(job and job.running)}
+
+
+@app.get("/api/candidates.csv")
+def api_candidates_csv():
+    from PhiEx.candidates.triage import rows_to_csv
+    from fastapi.responses import Response
+    job = SESSION.get("triage")
+    if job is None or not job.rows:
+        return JSONResponse({"error": "no triage results yet"}, status_code=404)
+    return Response(rows_to_csv(job.status()["rows"]), media_type="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=phiex_candidate_triage.csv"})
+
+
+@app.get("/api/candidates/local")
+def api_candidates_local():
+    """List candidate files kept locally under data/candidates/ (never in git)."""
+    from pathlib import Path
+    root = Path("data/candidates")
+    files = sorted(p.name for p in root.glob("*.tsv")) + sorted(p.name for p in root.glob("*.csv")
+                                                                if p.name != "triage_cache.csv")
+    return {"files": files}
+
+
+@app.get("/api/candidates/local/{name}")
+def api_candidates_local_file(name: str):
+    from pathlib import Path
+    from fastapi.responses import PlainTextResponse
+    p = Path("data/candidates") / Path(name).name
+    if not p.exists() or p.suffix not in (".tsv", ".csv"):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return PlainTextResponse(p.read_text())
+
+
+# ────────────────────────────────────────────────────────────────────────
+# sequence viewer (AlphaFold-DB-style sequence strip + feature tracks + PAE)
+# ────────────────────────────────────────────────────────────────────────
+
+@app.get("/api/sequence-track")
+def api_sequence_track():
+    from PhiEx.analysis.seqtrack import build_track
+    from PhiEx.analysis.site import detect_catalytic_sites
+    protein: Protein = SESSION.get("protein")
+    if not protein or not protein.residues:
+        return JSONResponse({"error": "load a structure first (stage 1)"}, status_code=400)
+    try:
+        hits = detect_catalytic_sites(protein)
+    except Exception:
+        hits = []
+    return build_track(protein, SESSION.get("uniprot") or None, SESSION.get("site"),
+                       SESSION.get("active_pocket"), SESSION.get("esm2_pred"),
+                       SESSION.get("pose_contacts"), hits)
+
+
+@app.get("/api/pae")
+def api_pae():
+    from PhiEx.analysis.seqtrack import fetch_pae
+    protein: Protein = SESSION.get("protein")
+    acc = SESSION.get("uniprot")
+    if not protein or not (protein.name or "").upper().startswith(("AF:", "AFILL:")):
+        return JSONResponse({"error": "PAE exists only for AlphaFold / AlphaFill models"}, status_code=404)
+    pae = fetch_pae(acc)
+    if pae is None:
+        return JSONResponse({"error": f"no PAE available for {acc}"}, status_code=404)
+    return pae
 
 
 class DynamicsRequest(BaseModel):

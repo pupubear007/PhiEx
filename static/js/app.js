@@ -277,12 +277,16 @@ const _pdbCache = new Map();          // containerId → pdb text
 // Per-viewer cleanup handles for the highlight overlay.
 const _highlightCells = new Map();    // containerId → array of state cells / refs
 
-$("#run-structure").addEventListener("click", async () => {
+async function runStructure() {
   const pdb = $("#i-pdb").value.trim();
   const uni = $("#i-uniprot").value.trim();
   try {
     const r = await postJSON("/api/structure", {pdb_id: pdb, uniprot: uni, run_esmfold: true});
     lastStruct = r;
+    if (r.experimental && r.experimental.name && r.experimental.name.toUpperCase() !== pdb.toUpperCase()) {
+      logSys(`⚠ ${pdb} unavailable — loaded ${r.experimental.name} instead`);
+      $("#i-pdb").value = r.experimental.name;
+    }
     if (r.predicted && r.predicted.pdb_text) {
       await loadPredictedWithPlddt(r.predicted.pdb_text);
       $("#v-plddt").textContent = (r.predicted.mean_plddt||0).toFixed(1)
@@ -297,8 +301,16 @@ $("#run-structure").addEventListener("click", async () => {
       `hetero groups: <b>${summarizeHet(r.cofactors)}</b><br>` +
       `active site: <b>—</b>`;
     residueLabels = r.residue_labels || {};
-  } catch(e){ alert("structure: "+e.message); }
-});
+    refreshSequence(true);
+    return true;
+  } catch(e){
+    logSys(`structure: ${e.message}`);
+    refreshSequence();                 // clears the strip instead of showing the old protein
+    alert("structure: "+e.message);
+    return false;
+  }
+}
+$("#run-structure").addEventListener("click", () => runStructure());
 
 $("#run-annotate").addEventListener("click", async () => {
   try {
@@ -310,10 +322,11 @@ $("#run-annotate").addEventListener("click", async () => {
       `<b>${(r.foldseek_hits||[]).length}</b> structural neighbours<br>` +
       `log10(E) σ: <b>${(r.go_uncertainty_log10||0).toFixed(2)}</b>` +
       `<div style="margin-top:6px">${top}</div>`;
+    refreshSequence();
   } catch(e){ alert("annotate: "+e.message); }
 });
 
-$("#run-pockets").addEventListener("click", async () => {
+async function runPockets() {
   try {
     const r = await postJSON("/api/pockets", {anchor: $("#i-anchor").value.trim() || null});
     lastPockets = r.pockets;
@@ -325,8 +338,10 @@ $("#run-pockets").addEventListener("click", async () => {
     if (r.active_site_id)
       $("#state-readout").innerHTML = $("#state-readout").innerHTML.replace(/active site:.*/,
         `active site: <b>${r.site ? r.site.label : r.active_site_id}</b> (${r.active_site_id})`);
+    refreshSequence();
   } catch(e){ alert("pockets: "+e.message); }
-});
+}
+$("#run-pockets").addEventListener("click", () => runPockets());
 
 $("#run-dock").addEventListener("click", async () => {
   try {
@@ -334,6 +349,7 @@ $("#run-dock").addEventListener("click", async () => {
     const r = await postJSON("/api/dock", {method: "vina", smiles: smi || null});
     lastPoses = r.poses;
     drawPoses(r.poses);
+    refreshSequence();
     $("#poses-readout").innerHTML =
       `<b>${r.ligand ? r.ligand.name : "ligand"}</b>: <b>${r.n_poses}</b> poses · best <b>${(r.poses[0]||{}).score?.toFixed(2)}</b> kcal/mol` +
       (((r.poses||[])[0]||{}).stub ? ` <span style="color:var(--warn, #c66)">[STUB — synthetic poses, Vina not installed]</span>` : "") +
@@ -908,3 +924,367 @@ function renderResult(r){
 
 // initial header refresh once theories begin populating
 setTimeout(refreshTheories, 500);
+
+// ════════════════════════════════════════════════════════════════════
+// Candidate-gene triage
+// ════════════════════════════════════════════════════════════════════
+let triagePoll = null;
+let triageRows = [];
+
+async function refreshCandidateFiles(){
+  try {
+    const r = await (await fetch("/api/candidates/local")).json();
+    const sel = $("#i-cand-file");
+    sel.innerHTML = `<option value="">— local candidate file —</option>` +
+      (r.files||[]).map(f => `<option value="${f}">${f}</option>`).join("");
+  } catch(_) {}
+}
+refreshCandidateFiles();
+
+$("#i-cand-file").addEventListener("change", async e => {
+  const name = e.target.value; if (!name) return;
+  const r = await fetch(`/api/candidates/local/${encodeURIComponent(name)}`);
+  if (r.ok) { $("#i-cands").value = await r.text(); logSys(`candidate file loaded: ${name}`); }
+});
+$("#cand-upload-btn").addEventListener("click", () => $("#i-cand-upload").click());
+$("#i-cand-upload").addEventListener("change", async e => {
+  const f = e.target.files[0]; if (!f) return;
+  $("#i-cands").value = await f.text();
+  logSys(`candidate file loaded from disk: ${f.name}`);
+});
+
+$("#run-triage").addEventListener("click", async () => {
+  const text = $("#i-cands").value.trim();
+  if (!text) { alert("triage: load or paste a candidate list first"); return; }
+  const body = {
+    text, dock: $("#i-cand-dock").checked,
+    organism: $("#i-cand-org").value,
+    sources: $("#i-cand-src").value.trim(),
+    tracks: $("#i-cand-track").value.split(","),
+    limit: parseInt($("#i-cand-limit").value || "0", 10),
+  };
+  try {
+    const r = await postJSON("/api/candidates/start", body);
+    $("#triage-readout").innerHTML = `triaging ${r.total} gene(s)… progress in the ticker`;
+    if (triagePoll) clearInterval(triagePoll);
+    triagePoll = setInterval(pollTriage, 3000);
+  } catch(e) { alert("triage: " + e.message); }
+});
+$("#stop-triage").addEventListener("click", () => postJSON("/api/candidates/stop", {}).catch(()=>{}));
+
+async function pollTriage(){
+  try {
+    const s = await (await fetch("/api/candidates/status")).json();
+    triageRows = s.rows || [];
+    renderTriage(s);
+    if (!s.running && triagePoll) { clearInterval(triagePoll); triagePoll = null; }
+  } catch(_) {}
+}
+
+function renderTriage(s){
+  const esc = v => String(v ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+  const fc = v => v == null ? "—" : (v > 0 ? "+" : "") + v.toFixed(1);
+  const rows = triageRows.map((r, i) => {
+    const struct = r.structure ? `${esc(r.structure.replace(/^AF:|^AFILL:/, m => m === "AFILL:" ? "AFill " : "AF "))}` +
+      (r.mean_plddt != null ? ` <span style="color:var(--ink-dim)">${r.mean_plddt.toFixed(0)}</span>` : "") : "—";
+    const site = r.site ? `${esc(r.site)} <span style="color:var(--ink-dim)">${esc(r.site_confidence)}</span>` : "—";
+    const dockc = r.error ? `<span style="color:var(--warn, #c66)" title="${esc(r.error)}">error</span>`
+      : r.best_ligand ? `${esc(r.best_ligand)} ${r.best_score.toFixed(1)}` +
+        (r.margin != null ? ` <b title="best binder − negative control (kcal/mol)">Δ${r.margin.toFixed(1)}</b>` : "")
+      : (r.track === "dock" ? `<span style="color:var(--ink-dim)">panel ready</span>` : "");
+    const warn = (r.warnings||[]).length ? ` <span title="${esc(r.warnings.join("\n"))}">⚠</span>` : "";
+    const full = $("#triage-readout").classList.contains("tri-full");
+    return `<tr class="tri-row" data-i="${i}" title="${esc(r.class_title)} — ${esc(r.description)}">` +
+      `<td>${esc(r.gene_id)}${warn}</td><td><span class="trk ${r.track}">${r.track}</span> ${esc(full ? r.class_title : r.class)}` +
+      (full ? `<div style="color:var(--ink-dim);font-size:10px">${esc((r.description||"").slice(0, 90))}</div>` : "") + `</td>` +
+      `<td class="num">${fc(r.peak_log2fc)}</td><td>${struct}</td><td>${site}</td><td>${dockc}</td></tr>`;
+  }).join("");
+  const counts = {dock:0, structure:0, unsuited:0};
+  triageRows.forEach(r => counts[r.track] = (counts[r.track]||0) + 1);
+  $("#triage-readout").innerHTML =
+    `<div style="margin-bottom:4px"><button class="btn" id="tri-expand" style="width:auto;padding:2px 8px;margin:0 6px 0 0;font-size:10px">${$("#triage-readout").classList.contains("tri-full") ? "✕ close" : "⤢ expand"}</button>` +
+    `${s.running ? "running" : "done"} · ${s.done}/${s.total} genes · ${s.elapsed}s · ` +
+    `<span class="trk dock">dock ${counts.dock}</span> <span class="trk structure">structure ${counts.structure}</span> ` +
+    `<span class="trk unsuited">unsuited ${counts.unsuited}</span></div>` +
+    `<div class="tri-wrap"><table class="screen-table"><tr><th>gene</th><th>class</th><th>log2FC</th><th>structure (pLDDT)</th><th>site</th><th>dock</th></tr>${rows}</table></div>` +
+    `<div style="color:var(--ink-dim);font-size:10px;margin-top:4px">click a row to open it: structure + site load, and its ligand panel fills the screen list (press 4b). ` +
+    `Δ = best binder − negative control, kcal/mol (larger = clearer).</div>` +
+    `<a href="/api/candidates.csv" download style="font-size:11px">⤓ download CSV</a>`;
+  document.querySelectorAll("#triage-readout tr.tri-row").forEach(tr =>
+    tr.addEventListener("click", () => {
+      $("#triage-readout").classList.remove("tri-full");
+      openCandidate(triageRows[+tr.dataset.i]);
+    }));
+  const ex = $("#tri-expand");
+  if (ex) ex.addEventListener("click", ev => {
+    ev.stopPropagation();
+    $("#triage-readout").classList.toggle("tri-full");
+    renderTriage(s);
+  });
+}
+
+async function openCandidate(r){
+  if (!r || !r.structure) { alert(`${r ? r.gene_id : "candidate"}: no structure available${r && r.error ? " — " + r.error : ""}`); return; }
+  $("#i-pdb").value = r.structure;
+  $("#i-uniprot").value = r.uniprot || "";
+  $("#i-anchor").value = "";
+  $("#i-smiles").value = "";
+  $("#i-ligands").value = (r.panel||[]).map(p => `${p.label}: ${p.value}`).join("\n");
+  logSys(`opening ${r.gene_id} (${r.class_title}) — ${r.structure}`);
+  if (r.note) logSys(`note: ${r.note}`);
+  (r.warnings||[]).forEach(w => logSys(`⚠ ${r.gene_id}: ${w}`));
+  if (!(await runStructure())) return;
+  await runPockets();
+  if (r.screen) renderScreen({rows: r.screen, n_ok: r.screen.filter(x=>!x.error).length,
+                              n_failed: r.screen.filter(x=>x.error).length, seconds: "cached",
+                              site: {label: r.site}, pocket_id: ""});
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Sequence viewer — AlphaFold-DB-style sequence strip, feature tracks,
+// PAE map; click/drag highlights residues in the 3D structure.
+// ════════════════════════════════════════════════════════════════════
+const SEQ = { data: null, cellW: 11, sel: null, dragFrom: null, overlay: [], pae: null };
+const PLDDT_BANDS = [[90, "#0053D6", "very high (>90)"], [70, "#65CBF3", "high (70–90)"],
+                     [50, "#FFDB13", "low (50–70)"], [-1, "#FF7D45", "very low (<50)"]];
+const FEAT_COLORS = {
+  "Signal": "#c478b3", "Transit peptide": "#a070c0", "Propeptide": "#8a6aa8", "Transmembrane": "#9aa0a6",
+  "Intramembrane": "#7d8288", "Domain": "#3d6fb0", "Region": "#5a6f8a", "Repeat": "#4e7f9a",
+  "Zinc finger": "#6a8fbf", "Coiled coil": "#556b7f", "Compositional bias": "#3a4552",
+  "Active site": "#ff4d4d", "Binding site": "#e69a3a", "Metal binding": "#d4c27a", "Site": "#e0c050",
+  "Motif": "#d4c27a", "Disulfide bond": "#e8e070", "Glycosylation": "#8fbf7f", "Modified residue": "#6fbfa0",
+  "Lipidation": "#bf9f6f", site: "#e05a4a", pocket: "#e69a3a", motif: "#d4c27a", catalytic: "#ff4d4d",
+  contact: "#8fbf7f", variant: "#ff8ad8",
+};
+const plddtColor = v => v == null ? "#2a2d33" : PLDDT_BANDS.find(b => v > b[0])[1];
+
+$("#seq-toggle").addEventListener("click", () => {
+  $("#seq-panel").classList.toggle("collapsed");
+  $("#seq-toggle").textContent = ($("#seq-panel").classList.contains("collapsed") ? "▸" : "▾") + " sequence";
+});
+$("#seq-refresh").addEventListener("click", () => refreshSequence(true));
+$("#seq-clear").addEventListener("click", () => clearSeqHighlight());
+$("#seq-pae").addEventListener("click", () => togglePae());
+
+async function refreshSequence(open=false){
+  try {
+    const r = await fetch("/api/sequence-track");
+    if (!r.ok) {
+      SEQ.data = null; SEQ.pae = null;
+      $("#seq-title").textContent = "no structure loaded";
+      $("#seq-legend").innerHTML = ""; $("#seq-scroll").innerHTML = "";
+      const lab = document.getElementById("seq-labels"); if (lab) lab.innerHTML = "";
+      $("#pae-box").classList.remove("on");
+      return;
+    }
+    SEQ.data = await r.json();
+    SEQ.sel = null;
+    renderSequence();
+    if (open && $("#seq-panel").classList.contains("collapsed")) $("#seq-toggle").click();
+    if ($("#pae-box").classList.contains("on")) loadPae();
+  } catch(e) { console.warn("[seq] refresh failed", e); }
+}
+
+function renderSequence(){
+  const d = SEQ.data; if (!d) return;
+  const W = SEQ.cellW, n = d.sequence.length;
+  const mean = d.plddt ? (d.plddt.filter(v => v != null).reduce((a, b) => a + b, 0) / d.plddt.filter(v => v != null).length) : null;
+  $("#seq-title").innerHTML = `<b>${d.name}</b> chain ${d.chain} · ${n} aa` +
+    (d.uniprot ? ` · UniProt <b>${d.uniprot}</b>` : "") +
+    (mean != null ? ` · mean pLDDT <b>${mean.toFixed(1)}</b>` : " · experimental (no pLDDT)");
+  $("#seq-legend").innerHTML = d.plddt ? PLDDT_BANDS.map(b => `<span style="background:${b[1]}"></span>${b[2]}`).join("") : "";
+  $("#seq-pae").style.display = d.is_model ? "" : "none";
+
+  const ROW_NUM = 11, ROW_SEQ = 14, ROW_TRK = 9, GAP = 3;
+  const tracks = d.tracks || [];
+  const H = ROW_NUM + ROW_SEQ + GAP + tracks.length * (ROW_TRK + GAP) + 2;
+  const width = n * W;
+  const idxOf = {}; d.residues.forEach((r, i) => idxOf[r] = i);
+  const x = resnum => (idxOf[resnum] ?? -1) * W;
+
+  let s = `<svg width="${width}" height="${H}" id="seq-svg">`;
+  for (let i = 0; i < n; i++) {
+    const rn = d.residues[i];
+    if (rn % 10 === 0) s += `<text x="${i * W + W / 2}" y="9" font-size="8" fill="#8a8a80" text-anchor="middle">${rn}</text>`;
+    s += `<rect x="${i * W}" y="${ROW_NUM}" width="${W - 1}" height="${ROW_SEQ}" fill="${plddtColor(d.plddt ? d.plddt[i] : null)}"/>`;
+    const dark = d.plddt && d.plddt[i] != null && d.plddt[i] > 50 && d.plddt[i] <= 90 ? "#0b0d10" : "#e8e6df";
+    s += `<text x="${i * W + W / 2}" y="${ROW_NUM + 11}" font-size="10" fill="${dark}" text-anchor="middle">${d.sequence[i]}</text>`;
+  }
+  let y = ROW_NUM + ROW_SEQ + GAP;
+  const labels = [];
+  for (const t of tracks) {
+    labels.push([t.name, y, t.label || ""]);
+    s += `<rect x="0" y="${y}" width="${width}" height="${ROW_TRK}" fill="#14171c"/>`;
+    if (t.kind === "values" && t.values) {
+      const vals = t.values.filter(v => v != null);
+      const lo = Math.min(...vals), hi = Math.max(...vals);
+      t.values.forEach((v, i) => {
+        if (v == null) return;
+        const f = hi > lo ? (v - lo) / (hi - lo) : 0;
+        const c = `rgb(${Math.round(27 + f * 185)},${Math.round(39 + f * 155)},${Math.round(51 + f * 71)})`;
+        s += `<rect x="${i * W}" y="${y}" width="${W - 1}" height="${ROW_TRK}" fill="${c}"/>`;
+      });
+    } else {
+      for (const f of (t.features || [])) {
+        const x0 = x(f.start), x1 = x(f.end);
+        if (x0 < 0 || x1 < 0) continue;
+        const c = FEAT_COLORS[f.type] || "#888";
+        s += `<rect x="${x0}" y="${y}" width="${Math.max(W - 1, x1 - x0 + W - 1)}" height="${ROW_TRK}" fill="${c}" opacity="0.9"/>`;
+      }
+    }
+    y += ROW_TRK + GAP;
+  }
+  s += `<rect id="seq-selrect" x="0" y="0" width="0" height="${H}" fill="#ffffff22" stroke="#ffd400" stroke-width="1" visibility="hidden"/>`;
+  s += `</svg>`;
+  $("#seq-scroll").innerHTML = s;
+
+  // fixed track-label column
+  let lab = document.getElementById("seq-labels");
+  if (!lab) {
+    lab = document.createElement("div"); lab.id = "seq-labels";
+    lab.style.cssText = "flex:0 0 auto;position:relative;font-size:9px;color:#8a8a80;width:118px;";
+    $("#seq-body").insertBefore(lab, $("#seq-scroll"));
+  }
+  lab.style.height = H + "px";
+  lab.innerHTML = `<div style="position:absolute;top:${ROW_NUM + 1}px">sequence${d.plddt ? " · pLDDT" : ""}</div>` +
+    labels.map(([nm, yy, tip]) => `<div title="${tip}" style="position:absolute;top:${yy - 1}px;white-space:nowrap;overflow:hidden;width:118px">${nm}</div>`).join("");
+
+  const svg = $("#seq-svg");
+  const idxAt = ev => {
+    const rect = svg.getBoundingClientRect();
+    return Math.max(0, Math.min(n - 1, Math.floor((ev.clientX - rect.left) / W)));
+  };
+  svg.addEventListener("mousemove", ev => {
+    const i = idxAt(ev);
+    showSeqTip(ev, i);
+    if (SEQ.dragFrom != null) drawSel(Math.min(SEQ.dragFrom, i), Math.max(SEQ.dragFrom, i));
+  });
+  svg.addEventListener("mouseleave", () => { $("#seq-tip").style.display = "none"; });
+  svg.addEventListener("mousedown", ev => { SEQ.dragFrom = idxAt(ev); drawSel(SEQ.dragFrom, SEQ.dragFrom); });
+  SEQ.idxAt = idxAt;
+  if (!SEQ.mouseupBound) {
+    SEQ.mouseupBound = true;
+    window.addEventListener("mouseup", ev => {
+      if (SEQ.dragFrom == null || !SEQ.data) return;
+      const i = SEQ.idxAt(ev), a = Math.min(SEQ.dragFrom, i), b = Math.max(SEQ.dragFrom, i);
+      SEQ.dragFrom = null;
+      const res = SEQ.data.residues.slice(a, b + 1);
+      highlightSeqResidues(res, a === b ? `${resName(a)}` : `${resName(a)}–${resName(b)} (${b - a + 1} aa)`);
+    });
+  }
+  SEQ.H = H; fitSeqPanel();
+}
+
+function fitSeqPanel(){
+  const pae = $("#pae-box").classList.contains("on") ? 225 : 0;
+  $("#seq-panel").style.maxHeight = (Math.max(SEQ.H || 0, pae) + 46) + "px";
+}
+
+function resName(i){ const d = SEQ.data; return `${d.sequence[i]}${d.residues[i]}`; }
+
+function drawSel(a, b){
+  const r = $("#seq-selrect"); if (!r) return;
+  r.setAttribute("x", a * SEQ.cellW); r.setAttribute("width", (b - a + 1) * SEQ.cellW);
+  r.setAttribute("visibility", "visible");
+}
+
+function showSeqTip(ev, i){
+  const d = SEQ.data, rn = d.residues[i];
+  const lines = [`<b>${resName(i)}</b>` + (d.plddt && d.plddt[i] != null ? ` · pLDDT ${d.plddt[i].toFixed(1)}` : "")];
+  for (const t of d.tracks || []) {
+    if (t.kind === "values" && t.values && t.values[i] != null) lines.push(`${t.name}: ${t.values[i].toFixed(2)}`);
+    for (const f of (t.features || [])) if (rn >= f.start && rn <= f.end) lines.push(`${f.label}`);
+  }
+  const tip = $("#seq-tip");
+  tip.innerHTML = lines.join("<br>");
+  tip.style.display = "block";
+  tip.style.left = Math.min(window.innerWidth - 370, ev.clientX + 12) + "px";
+  tip.style.top = (ev.clientY - 10 - tip.offsetHeight) + "px";
+}
+
+// 3D: overlay the selected residues (chain-restricted) on the structure in
+// the lower viewer, as yellow sticks, and fly the camera to them.
+async function highlightSeqResidues(resnums, label){
+  const d = SEQ.data; if (!d || !resnums.length) return;
+  await clearSeqHighlight();
+  const viewer = expViewer;
+  const pdb = _pdbCache.get("viewer-exp");
+  if (!viewer || !viewer.plugin || !pdb) { logSys("sequence: no structure in the 3D viewer to highlight"); return; }
+  const want = new Set(resnums);
+  const lines = pdb.split(/\r?\n/).filter(l => l.startsWith("ATOM") &&
+    (l.substring(21, 22).trim() || "A") === (d.chain || "A") && want.has(parseInt(l.substring(22, 26), 10)));
+  if (!lines.length) { logSys(`sequence: residues not found in the loaded model (${label})`); return; }
+  const plugin = viewer.plugin;
+  try {
+    const data = await plugin.builders.data.rawData({ data: lines.join("\n") + "\nEND\n", label: "seq-selection" });
+    const traj = await plugin.builders.structure.parseTrajectory(data, "pdb");
+    const model = await plugin.builders.structure.createModel(traj);
+    const structure = await plugin.builders.structure.createStructure(model);
+    await plugin.builders.structure.representation.addRepresentation(structure, {
+      type: "ball-and-stick", color: "uniform", colorParams: { value: 0xffd400 }, sizeParams: { scale: 1.3 } });
+    SEQ.overlay.push(data);
+    try {
+      const st = structure.cell && structure.cell.obj && structure.cell.obj.data;
+      if (st) plugin.managers.camera.focusLoci({ kind: "structure-loci", structure: st });
+    } catch(_) {}
+    logSys(`sequence → 3D: ${label}`);
+  } catch(e) { console.warn("[seq] highlight failed", e); }
+}
+
+async function clearSeqHighlight(){
+  const viewer = expViewer;
+  if (!viewer || !viewer.plugin) { SEQ.overlay = []; return; }
+  for (const cell of SEQ.overlay) {
+    const ref = (cell && cell.ref) || (cell && cell.transform && cell.transform.ref);
+    if (ref) { try { await viewer.plugin.state.data.build().delete(ref).commit(); } catch(_) {} }
+  }
+  SEQ.overlay = [];
+  const r = $("#seq-selrect"); if (r) r.setAttribute("visibility", "hidden");
+}
+
+// PAE map (AlphaFold DB): green = confident relative placement
+async function togglePae(){
+  const box = $("#pae-box");
+  box.classList.toggle("on");
+  fitSeqPanel();
+  if (box.classList.contains("on")) await loadPae();
+}
+
+async function loadPae(){
+  try {
+    const r = await fetch("/api/pae");
+    const j = await r.json();
+    if (!r.ok) { logSys(`PAE: ${j.error || j.detail}`); $("#pae-box").classList.remove("on"); fitSeqPanel(); return; }
+    SEQ.pae = j; drawPae();
+  } catch(e) { console.warn("[pae]", e); }
+}
+
+function drawPae(sel){
+  const p = SEQ.pae; if (!p) return;
+  const cv = $("#pae-canvas"), m = p.matrix.length;
+  const size = Math.min(200, Math.max(120, m));
+  cv.width = cv.height = size;
+  const ctx = cv.getContext("2d"), px = size / m;
+  for (let i = 0; i < m; i++) for (let j = 0; j < m; j++) {
+    const f = Math.min(1, p.matrix[i][j] / (p.max || 31.75));
+    const g = Math.round(68 + f * 187), rr = Math.round(f * 255), b = Math.round(27 + f * 228);
+    ctx.fillStyle = `rgb(${rr},${g},${b})`;
+    ctx.fillRect(j * px, i * px, Math.ceil(px), Math.ceil(px));
+  }
+  if (sel) { ctx.strokeStyle = "#ffd400"; ctx.strokeRect(sel[0], sel[1], sel[2] - sel[0], sel[3] - sel[1]); }
+  let start = null;
+  cv.onmousedown = ev => { const r = cv.getBoundingClientRect(); start = [ev.clientX - r.left, ev.clientY - r.top]; };
+  cv.onmouseup = ev => {
+    if (!start) return;
+    const r = cv.getBoundingClientRect(), end = [ev.clientX - r.left, ev.clientY - r.top];
+    const toRes = v => Math.max(1, Math.min(p.n, Math.floor(v / px) * p.bin + 1));
+    const xs = [toRes(Math.min(start[0], end[0])), toRes(Math.max(start[0], end[0])) + p.bin - 1];
+    const ys = [toRes(Math.min(start[1], end[1])), toRes(Math.max(start[1], end[1])) + p.bin - 1];
+    drawPae([Math.min(start[0], end[0]), Math.min(start[1], end[1]), Math.max(start[0], end[0]), Math.max(start[1], end[1])]);
+    start = null;
+    const set = new Set();
+    for (let k = xs[0]; k <= Math.min(p.n, xs[1]); k++) set.add(k);
+    for (let k = ys[0]; k <= Math.min(p.n, ys[1]); k++) set.add(k);
+    highlightSeqResidues([...set], `PAE box: ${ys[0]}–${ys[1]} × ${xs[0]}–${xs[1]}`);
+  };
+}

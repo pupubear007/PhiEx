@@ -177,6 +177,25 @@ make weights   # ~5 GB download for ESMFold + ESM-2 + MACE-OFF23
 make run       # http://localhost:8000
 ```
 
+Optional — real Foldseek and P2Rank instead of their stubs (any machine;
+the M4 Pro with 48 GB is the comfortable one for the Foldseek PDB database):
+
+```
+cd ~/PhiEx && conda activate PhiEx
+make tools     # foldseek (bioconda, or the official static binary) +
+               # P2Rank 2.4.2 + openjdk 17, all inside the PhiEx env / ./tools
+make weights   # now also builds the Foldseek PDB database under models/foldseek
+make run       # registry panel: foldseek / p2rank without the STUB tag
+```
+
+When a candidate asks for AlphaFill (cofactor transplant) and AlphaFill has
+no model for that accession, PhiEx loads the plain AlphaFold model instead,
+says so in the log and the triage warnings, and finds the cofactor site from
+sequence motifs (row 3b above).
+
+Check by hand with `foldseek version` and `prank -v`.  A different P2Rank
+release: `P2RANK_VERSION=2.5 make tools`.
+
 ### MSI (x86_64 Linux)
 
 ```
@@ -215,6 +234,7 @@ MACE region, mutation panel, discovery flags — is built around that site.
 | 1 | **your anchor** — the *Site anchor* box / `anchor` API field, e.g. `S197,H351,E314`, `Ser197`, `A:197` | always wins | `user` |
 | 2 | **real cofactor** in the structure (heme Fe, FAD, NAD …) | crystal structures with HETATM cofactors | `high` |
 | 3 | **catalytic triad/dyad** found geometrically: Ser/Cys–His–Asp/Glu hydrogen-bond network (≤ 3.6 Å), boosted by a G‑x‑S‑x‑G nucleophile-elbow motif | serine / cysteine hydrolases, esterases, lipases, proteases | `high` with motif + acid, else `medium` |
+| 3b | **cofactor-binding motif** in an apo model (AlphaFold without the cofactor): class-I SAM methyltransferase motif I `hh(D/E)hGxGxG`, Rossmann dinucleotide loop `GxGxxG` (NAD(P)/FAD); motif must be ordered (pLDDT ≥ 70). A medium-confidence triad without the G-x-S-x-G motif ranks below this | SAM methyltransferases (ERG6 …), FAD/NAD(P) oxidoreductases when AlphaFill has no model; default probe for a SAM site is SAM itself | `medium` |
 | 4 | **top P2Rank pocket** | nothing above found | `medium` (`low` with the geometric fallback) |
 | 5 | protein centroid | nothing at all | `low` |
 
@@ -267,6 +287,66 @@ sensitivity) points to but sequence-level attention does not — candidates
 for mutagenesis around a site you trust. They are only as good as the
 site: check the *site* line in the Pockets panel (source + confidence)
 before using them.
+
+## Sequence viewer (AlphaFold-DB style)
+
+The strip under the two 3D panels (**▸ sequence**) shows the working chain
+the way the AlphaFold DB entry page does, with PhiEx's own results added:
+
+| track | source |
+|---|---|
+| sequence, coloured by pLDDT | AlphaFold / AlphaFill model B-factors (dark blue > 90, light blue 70–90, yellow 50–70, orange < 50); grey for experimental structures |
+| UniProt topology / domains / sites / PTM | UniProt entry features (signal peptide, TM, domains, active and binding sites, disulfides, glycosylation); mapped by alignment if the structure is not numbered like UniProt |
+| PhiEx site / pocket | the resolved active site (stage 3) and the residues lining the active pocket |
+| catalytic motifs | G-x-S-x-G nucleophile elbow, HGG/HGA oxyanion hole, detected Ser/Cys–His–Asp/Glu triads |
+| docked-ligand contacts | residues ≤ 4 Å from the best Vina pose (stage 4) |
+| ESM-2 constraint | per-position mean −LLR of the 19 substitutions (stage 2); bright = the language model rejects changes there |
+| isolate variants | reserved for the RNA-seq variant step (not yet filled) |
+
+* hover → residue, pLDDT and every feature covering it
+* click or drag → those residues drawn as yellow sticks in the lower 3D panel, camera centred on them; **clear 3D** removes them
+* **PAE** → AlphaFold predicted-aligned-error map (green = confident relative placement); drag a box on it to highlight both residue ranges in 3D — a quick way to see whether a domain or loop is placed reliably relative to the active site
+* **↻ tracks** rebuilds after stages 2–4 (also done automatically)
+
+Endpoints: `GET /api/sequence-track`, `GET /api/pae`.
+
+## Candidate-gene triage (transcriptomics → structure → ligands)
+
+For a list of candidate genes from an expression study (e.g. DESeq2 hits,
+network hubs, predicted effectors/CAZymes), PhiEx asks, gene by gene, *what
+can structure-based modelling actually say about this protein?*
+
+1. **Class and track** (`PhiEx/candidates/classes.py`): the annotation and
+   CAZy family are matched against explicit rules. Each class has a track —
+   **dock** (enzyme or binding protein with known small-molecule partners),
+   **structure** (no known ligand: use structure, pockets and Foldseek
+   neighbours to build a function hypothesis) or **unsuited** (transcription
+   factors, transposon proteins, membrane transporters, protein–protein
+   binders, housekeeping machinery) — plus the cofactor its site needs and a
+   ligand panel with roles (substrate / product / inhibitor / cofactor /
+   **negative control**).
+2. **UniProt**: from the STRING id when given, else the UniProt REST search
+   (`SS1G_xxxxx` → organism 665079; `Glyma.xxGxxxxxx` → ORF name
+   `GLYMA_xxGxxxxxx`, taxon 3847). Cached in `data/candidates/`.
+3. **Structure**: experimental PDB if one exists, else **AlphaFill** when the
+   class needs a cofactor (heme, Cu, FAD, NAD(P), PLP, Fe, Mn …), else
+   AlphaFold, else SWISS-MODEL.
+4. **Site and confidence**: site resolution as above; mean pLDDT and the
+   pLDDT of the site residues (site pLDDT < 70 is flagged).
+5. **Optional docking**: the class panel is docked into the site and the row
+   reports the best binder and its **margin over the negative control**
+   (kcal/mol). The margin, not the raw Vina score, is what to rank on.
+
+In the UI: *CANDIDATE GENES* (left) — load a TSV with a `gene_id` column
+(optional `uniprot`, `description`, `family`, `sources`, `log2fc_24/48/96`)
+or paste gene IDs; filter by organism, source table, track; tick *dock
+panels* for docking (about a minute per gene). Results stream into
+*CANDIDATE TRIAGE* (right); click a row to open its structure and site, with
+its ligand panel loaded into the screen list. CSV: `/api/candidates.csv`.
+Results are cached per gene, so a long list can be stopped and resumed.
+
+Candidate files and caches live in `data/candidates/`, which is git-ignored:
+unpublished candidate lists never leave the machine through the repository.
 
 ## Known simplifications and stubs (called out explicitly)
 
